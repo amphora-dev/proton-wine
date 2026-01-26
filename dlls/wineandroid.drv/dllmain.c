@@ -123,6 +123,6 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
     if (__wine_init_unix_call()) return FALSE;
 
     params.register_window_callback = register_window_callback;
-    params.start_device_callback = android_start_device;
+    params.start_device_callback = (UINT_PTR)android_start_device;
     return !ANDROID_CALL( init, &params );
 }
