@@ -2522,9 +2522,9 @@ static void start_main_thread(void)
 #define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
 #endif
 
-JavaVM *java_vm = NULL;
-jobject java_object = 0;
-unsigned short java_gdt_sel = 0;
+DECLSPEC_EXPORT JavaVM *java_vm = NULL;
+DECLSPEC_EXPORT jobject java_object = 0;
+DECLSPEC_EXPORT unsigned short java_gdt_sel = 0;
 
 /* main Wine initialisation */
 static jstring wine_init_jni( JNIEnv *env, jobject obj, jobjectArray cmdline, jobjectArray environment )
