@@ -95,7 +95,7 @@ extern UINT ANDROID_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp );
 extern LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
 extern BOOL ANDROID_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects );
 extern BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface );
-extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags, BOOL fullscreen,
+extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                       const struct window_rects *new_rects, struct window_surface *surface );
 extern ANativeWindow *get_client_window( HWND hwnd );
 extern BOOL has_client_surface( HWND hwnd );
