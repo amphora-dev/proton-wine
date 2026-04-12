@@ -236,11 +236,11 @@ static inline void wrap_java_call(void)   { __asm__( "mov %0,%%fs" :: "r" (java_
 static inline void unwrap_java_call(void) { __asm__( "mov %0,%%fs" :: "r" (orig_fs) ); }
 static inline void init_java_thread( JavaVM *java_vm )
 {
-    java_fs = *p_java_gdt_sel;
+    java_fs = java_gdt_sel;
     __asm__( "mov %%fs,%0" : "=r" (orig_fs) );
     __asm__( "mov %0,%%fs" :: "r" (java_fs) );
     (*java_vm)->AttachCurrentThread( java_vm, &jni_env, 0 );
-    if (!*p_java_gdt_sel) __asm__( "mov %%fs,%0" : "=r" (java_fs) );
+    if (!java_gdt_sel) __asm__( "mov %%fs,%0" : "=r" (java_fs) );
     __asm__( "mov %0,%%fs" :: "r" (orig_fs) );
 }
 
@@ -572,14 +572,12 @@ static int status_to_android_error( unsigned int status )
 
 static jobject load_java_method( jmethodID *method, const char *name, const char *args )
 {
-    jobject object = *p_java_object;
-
     if (!*method)
     {
         jclass class;
 
         wrap_java_call();
-        class = (*jni_env)->GetObjectClass( jni_env, object );
+        class = (*jni_env)->GetObjectClass( jni_env, java_object );
         *method = (*jni_env)->GetMethodID( jni_env, class, name, args );
         unwrap_java_call();
         if (!*method)
@@ -588,7 +586,7 @@ static jobject load_java_method( jmethodID *method, const char *name, const char
             return NULL;
         }
     }
-    return object;
+    return java_object;
 }
 
 static void create_desktop_view(void)
@@ -1068,9 +1066,7 @@ NTSTATUS android_dispatch_ioctl( void *arg )
 
 NTSTATUS android_java_init( void *arg )
 {
-    JavaVM *java_vm;
-
-    if (!(java_vm = *p_java_vm)) return STATUS_UNSUCCESSFUL;  /* not running under Java */
+    if (!java_vm) return STATUS_UNSUCCESSFUL;  /* not running under Java */
 
     init_java_thread( java_vm );
     create_desktop_view();
@@ -1079,9 +1075,7 @@ NTSTATUS android_java_init( void *arg )
 
 NTSTATUS android_java_uninit( void *arg )
 {
-    JavaVM *java_vm;
-
-    if (!(java_vm = *p_java_vm)) return STATUS_UNSUCCESSFUL;  /* not running under Java */
+    if (!java_vm) return STATUS_UNSUCCESSFUL;  /* not running under Java */
 
     wrap_java_call();
     (*java_vm)->DetachCurrentThread( java_vm );
