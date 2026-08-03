@@ -1,0 +1,134 @@
+name: Amphora Proton x86_64 (minimal)
+
+# Amphora-only: single arch (x86_64 + box64), SDK 35 / 16KB pages.
+# No aarch64/arm64ec matrix, no duplicate Wine-type package.
+# Post-install: strip symbols only — keep full Wine bin tools.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [amphora/x86_64-min]
+    paths:
+      - ".github/workflows/build-amphora-x86_64.yml"
+      - "build-scripts/amphora-pack-x86_64.sh"
+      - "build-scripts/build-step-x86_64.sh"
+      - "build-scripts/build-step0*.sh"
+      - "android/patches/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up build environment
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip flex bison gettext \
+            autoconf automake libtool pkg-config mingw-w64 \
+            gcc-multilib g++-multilib \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 \
+            zlib1g-dev zlib1g-dev:i386 \
+            zstd
+
+      - name: Download and extract termuxfs (x86_64)
+        run: |
+          mkdir -p "$HOME/termuxfs/x86_64"
+          cd "$HOME/termuxfs/x86_64"
+          wget -q https://github.com/WinNative-Emu/proton-wine/releases/download/Assets/termuxfs-x86_64.tar
+          tar -xf termuxfs-x86_64.tar
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: android-ndk-r27d
+
+      - name: Set up Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Cache LLVM MinGW toolchain
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+          key: bylaws-llvm-mingw-20250920
+
+      - name: Set up LLVM MinGW toolchain
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen
+        run: bash build-scripts/build-step0-autogen.sh
+
+      - name: Cache wine-tools
+        id: cache-wine-tools
+        uses: actions/cache@v4
+        with:
+          path: wine-tools
+          key: amphora-wine-tools-${{ hashFiles('configure.ac', 'configure') }}
+
+      - name: Build wine-tools (step 0)
+        if: steps.cache-wine-tools.outputs.cache-hit != 'true'
+        run: bash build-scripts/build-step0.sh
+
+      - name: Configure (x86_64, 16KB pages, android patches)
+        run: bash build-scripts/build-step-x86_64.sh --enable-16kb-pages --configure
+
+      - name: Build
+        run: bash build-scripts/build-step-x86_64.sh --enable-16kb-pages --build
+
+      - name: Install (symlink bin/wine — no shell/box64 wrapper)
+        run: bash build-scripts/build-step-x86_64.sh --enable-16kb-pages --install
+
+      - name: Download prefixPack
+        run: |
+          wget -q https://github.com/WinNative-Emu/proton-wine/releases/download/Assets/prefixPack-x86_64-11.txz \
+            -O "$GITHUB_WORKSPACE/prefixPack.txz"
+
+      - name: Strip + prune + pack Amphora .wcp
+        run: |
+          bash build-scripts/amphora-pack-x86_64.sh \
+            --output-dir "$HOME/compiled-files-x86_64" \
+            --prefix-pack "$GITHUB_WORKSPACE/prefixPack.txz" \
+            --out "$GITHUB_WORKSPACE/Proton-11.0-amphora-x86_64.wcp" \
+            --sha "$GITHUB_SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Proton-11.0-amphora-x86_64
+          path: Proton-11.0-amphora-x86_64.wcp
+          retention-days: 30
+
+      - name: Summarize size
+        run: |
+          ls -lah Proton-11.0-amphora-x86_64.wcp
+          echo "### Amphora Proton x86_64" >> "$GITHUB_STEP_SUMMARY"
+          echo "- artifact: \`Proton-11.0-amphora-x86_64.wcp\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- size: $(du -h Proton-11.0-amphora-x86_64.wcp | awk '{print $1}')" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
