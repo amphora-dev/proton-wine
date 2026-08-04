@@ -1,0 +1,50 @@
+name: Bump content_manifest pin
+description: Update one pin in amphora-dev/content_manifest
+inputs:
+  component:
+    description: "components.<name> key (wine, box64, …). Mutually exclusive with runtime_asset."
+    required: false
+    default: ""
+  runtime_asset:
+    description: "runtimeAssets[].assetPath. Mutually exclusive with component."
+    required: false
+    default: ""
+  sha256:
+    required: true
+  size:
+    required: true
+  token:
+    description: "PAT with write access to content_manifest"
+    required: true
+  asset_path:
+    required: false
+    default: ""
+  ver_name:
+    required: false
+    default: ""
+  remote_url:
+    required: false
+    default: ""
+  kind:
+    required: false
+    default: ""
+  content_type:
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Bump pin
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        COMPONENT: ${{ inputs.component }}
+        RUNTIME_ASSET: ${{ inputs.runtime_asset }}
+        SHA256: ${{ inputs.sha256 }}
+        SIZE: ${{ inputs.size }}
+        ASSET_PATH: ${{ inputs.asset_path }}
+        VER_NAME: ${{ inputs.ver_name }}
+        REMOTE_URL: ${{ inputs.remote_url }}
+        KIND: ${{ inputs.kind }}
+        CONTENT_TYPE: ${{ inputs.content_type }}
+      run: bash ci/publish/bump-manifest.sh

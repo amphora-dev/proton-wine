@@ -3,6 +3,7 @@ name: Amphora Proton x86_64 (minimal)
 # Amphora-only: single arch (x86_64 + box64), SDK 35 / 16KB pages.
 # No aarch64/arm64ec matrix, no duplicate Wine-type package.
 # Post-install: strip symbols only — keep full Wine bin tools.
+# On success: publish Release tag `proton-x86_64` and pin content_manifest.wine.
 
 on:
   workflow_dispatch:
@@ -10,10 +11,15 @@ on:
     branches: [amphora/x86_64-min]
     paths:
       - ".github/workflows/build-amphora-x86_64.yml"
+      - ".github/actions/bump-manifest/**"
       - "build-scripts/amphora-pack-x86_64.sh"
       - "build-scripts/build-step-x86_64.sh"
       - "build-scripts/build-step0*.sh"
+      - "ci/publish/**"
       - "android/patches/**"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -110,25 +116,77 @@ jobs:
           wget -q https://github.com/WinNative-Emu/proton-wine/releases/download/Assets/prefixPack-x86_64-11.txz \
             -O "$GITHUB_WORKSPACE/prefixPack.txz"
 
-      - name: Strip + prune + pack Amphora .wcp
+      - name: Strip + pack Amphora .wcp
+        id: pack
         run: |
+          WCP_NAME=Proton-11.0-amphora-x86_64.wcp
+          VER_NAME=11.0-amphora-x86_64
           bash build-scripts/amphora-pack-x86_64.sh \
             --output-dir "$HOME/compiled-files-x86_64" \
             --prefix-pack "$GITHUB_WORKSPACE/prefixPack.txz" \
-            --out "$GITHUB_WORKSPACE/Proton-11.0-amphora-x86_64.wcp" \
+            --out "$GITHUB_WORKSPACE/$WCP_NAME" \
             --sha "$GITHUB_SHA"
+          SHA256=$(sha256sum "$WCP_NAME" | awk '{print $1}')
+          SIZE=$(stat -c%s "$WCP_NAME")
+          echo "$SHA256  $WCP_NAME" > "${WCP_NAME}.sha256sum"
+          echo "WCP_NAME=$WCP_NAME" >> "$GITHUB_ENV"
+          echo "VER_NAME=$VER_NAME" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Proton-11.0-amphora-x86_64
-          path: Proton-11.0-amphora-x86_64.wcp
+          path: |
+            Proton-11.0-amphora-x86_64.wcp
+            Proton-11.0-amphora-x86_64.wcp.sha256sum
           retention-days: 30
 
-      - name: Summarize size
+      - name: Publish Release proton-x86_64
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_REF: ${{ github.sha }}
         run: |
-          ls -lah Proton-11.0-amphora-x86_64.wcp
-          echo "### Amphora Proton x86_64" >> "$GITHUB_STEP_SUMMARY"
-          echo "- artifact: \`Proton-11.0-amphora-x86_64.wcp\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- size: $(du -h Proton-11.0-amphora-x86_64.wcp | awk '{print $1}')" >> "$GITHUB_STEP_SUMMARY"
-          echo "- commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          BODY=$(cat <<EOF
+          Amphora Proton \`${{ env.VER_NAME }}\` (x86_64, stripped, symlink wine).
+
+          - commit: ${{ github.sha }}
+          - sha256: \`${{ env.SHA256 }}\`
+          - size: ${{ env.SIZE }}
+          EOF
+          )
+          bash ci/publish/fixed-release.sh \
+            --tag proton-x86_64 \
+            --title "Proton x86_64 (Amphora)" \
+            --body "$BODY" \
+            --latest \
+            -- "$WCP_NAME" "${WCP_NAME}.sha256sum"
+
+      - name: Pin content_manifest wine
+        uses: ./.github/actions/bump-manifest
+        with:
+          component: wine
+          sha256: ${{ env.SHA256 }}
+          size: ${{ env.SIZE }}
+          asset_path: ${{ env.WCP_NAME }}
+          ver_name: ${{ env.VER_NAME }}
+          remote_url: https://github.com/${{ github.repository }}/releases/download/proton-x86_64/${{ env.WCP_NAME }}
+          kind: WCP
+          content_type: Proton
+          token: ${{ secrets.AMPHORA_REPO_TOKEN }}
+
+      - name: Summarize
+        run: |
+          ls -lah "$WCP_NAME"
+          {
+            echo "### Amphora Proton x86_64"
+            echo "- artifact: \`$WCP_NAME\`"
+            echo "- size: $(du -h "$WCP_NAME" | awk '{print $1}')"
+            echo "- sha256: \`$SHA256\`"
+            echo "- release: https://github.com/${{ github.repository }}/releases/tag/proton-x86_64"
+            echo "- commit: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
