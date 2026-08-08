@@ -643,14 +643,10 @@ static BOOL unix_to_win_locale( const char *unix_name, char *win_name )
     char buffer[LOCALE_NAME_MAX_LENGTH];
     char *p, *country = NULL, *modifier = NULL;
 
-    /* Bionic accepts requested locales but reports C.UTF-8 from setlocale().
-     * Fall back to LC_ALL so Android launchers can select Wine's ANSI codepage. */
-    if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ) ||
-        !strcmp( unix_name, "C.UTF-8" ) || !strcmp( unix_name, "C.utf8" ))
+    if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ))
     {
         unix_name = getenv( "LC_ALL" );
-        if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ) ||
-            !strcmp( unix_name, "C.UTF-8" ) || !strcmp( unix_name, "C.utf8" )) return FALSE;
+        if (!unix_name || !unix_name[0]) return FALSE;
     }
 
     if (strlen( unix_name ) >= LOCALE_NAME_MAX_LENGTH) return FALSE;
@@ -727,6 +723,23 @@ static const NLS_LOCALE_DATA *get_win_locale( const NLS_LOCALE_HEADER *header, c
 }
 
 
+#ifdef __ANDROID__
+static const char *android_requested_locale( const char *actual, const char *category )
+{
+    const char *env;
+
+    if (actual && actual[0] && strcmp( actual, "C" ) && strcmp( actual, "C.UTF-8" ) &&
+        strcmp( actual, "C.utf8" ) && strcmp( actual, "POSIX" ) && strcmp( actual, "en_US.UTF-8" ))
+        return actual;
+
+    if ((env = getenv( "LC_ALL" )) && env[0]) return env;
+    if (category && (env = getenv( category )) && env[0]) return env;
+    if ((env = getenv( "LANG" )) && env[0]) return env;
+    return actual;
+}
+#endif
+
+
 /******************************************************************
  *		init_locale
  */
@@ -744,6 +757,11 @@ static void init_locale(void)
         FIXME_(nls)( "Failed to set LC_CTYPE to %s, is the locale supported?\n", debugstr_a(ctype) );
     if (!(messages = setlocale( LC_MESSAGES, "" )) && (messages = getenv( "LC_MESSAGES" )))
         FIXME_(nls)( "Failed to set LC_MESSAGES to %s, is the locale supported?\n", debugstr_a(messages) );
+
+#ifdef __ANDROID__
+    ctype = android_requested_locale( ctype, "LC_CTYPE" );
+    messages = android_requested_locale( messages, "LC_MESSAGES" );
+#endif
 
     if (!unix_to_win_locale( ctype, system_locale )) system_locale[0] = 0;
     TRACE_(nls)( "Unix LC_CTYPE is %s, setting system locale to %s\n", debugstr_a(ctype), debugstr_a(user_locale) );
