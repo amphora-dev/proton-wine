@@ -13,6 +13,7 @@ SOURCES = \
 	dce.c \
 	dde.c \
 	dialog.c \
+	dialog_unicode.rc \
 	edit.c \
 	generated.c \
 	input.c \
