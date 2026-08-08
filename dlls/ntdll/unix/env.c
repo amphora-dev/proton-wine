@@ -643,10 +643,14 @@ static BOOL unix_to_win_locale( const char *unix_name, char *win_name )
     char buffer[LOCALE_NAME_MAX_LENGTH];
     char *p, *country = NULL, *modifier = NULL;
 
-    if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ))
+    /* Bionic accepts requested locales but reports C.UTF-8 from setlocale().
+     * Fall back to LC_ALL so Android launchers can select Wine's ANSI codepage. */
+    if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ) ||
+        !strcmp( unix_name, "C.UTF-8" ) || !strcmp( unix_name, "C.utf8" ))
     {
         unix_name = getenv( "LC_ALL" );
-        if (!unix_name || !unix_name[0]) return FALSE;
+        if (!unix_name || !unix_name[0] || !strcmp( unix_name, "C" ) ||
+            !strcmp( unix_name, "C.UTF-8" ) || !strcmp( unix_name, "C.utf8" )) return FALSE;
     }
 
     if (strlen( unix_name ) >= LOCALE_NAME_MAX_LENGTH) return FALSE;
