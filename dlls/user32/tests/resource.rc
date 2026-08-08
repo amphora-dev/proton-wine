@@ -17,6 +17,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#pragma code_page(65001)
+
 #include "windef.h"
 #include "winuser.h"
 
@@ -166,6 +168,13 @@ STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Dialog"
 FONT 8, "MS Sans Serif"
 BEGIN
+END
+
+ANSI_DIALOG_UNICODE_CONTROL DIALOG 0, 0, 120, 30
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "ANSI dialog"
+BEGIN
+    CONTROL "半角: ﾊﾞｲｷｭｰﾋﾞｯｸ", 1001, "unicode_dialog_control", WS_CHILD | WS_VISIBLE, 5, 5, 110, 12
 END
 
 MULTI_EDIT_DIALOG DIALOG 0, 0, 160, 75

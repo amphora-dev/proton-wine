@@ -2518,6 +2518,41 @@ static void test_create_controls(void)
     DestroyWindow(control);
 }
 
+static LRESULT CALLBACK unicode_dialog_control_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static INT_PTR CALLBACK unicode_control_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    return FALSE;
+}
+
+static void test_ansi_dialog_unicode_control_caption(void)
+{
+    static const WCHAR class_name[] = L"unicode_dialog_control";
+    static const WCHAR expected[] = L"\x534a\x89d2: \xff8a\xff9e\xff72\xff77\xff6d\xff70\xff8b\xff9e\xff6f\xff78";
+    WNDCLASSW class = {0};
+    WCHAR text[ARRAY_SIZE(expected) + 1];
+    HWND dialog, control;
+
+    class.lpfnWndProc = unicode_dialog_control_proc;
+    class.hInstance = g_hinst;
+    class.lpszClassName = class_name;
+    ok(RegisterClassW(&class), "failed to register Unicode dialog control class\n");
+
+    dialog = CreateDialogParamA(g_hinst, "ANSI_DIALOG_UNICODE_CONTROL", 0, unicode_control_dialog_proc, 0);
+    ok(!!dialog, "failed to create ANSI dialog\n");
+    control = GetDlgItem(dialog, 1001);
+    ok(!!control, "failed to create Unicode dialog control\n");
+    ok(IsWindowUnicode(control), "expected a Unicode dialog control\n");
+    GetWindowTextW(control, text, ARRAY_SIZE(text));
+    ok(!wcscmp(text, expected), "expected %s, got %s\n", wine_dbgstr_w(expected), wine_dbgstr_w(text));
+
+    DestroyWindow(dialog);
+    UnregisterClassW(class_name, g_hinst);
+}
+
 START_TEST(dialog)
 {
     char **argv;
@@ -2544,6 +2579,7 @@ START_TEST(dialog)
     test_GetDlgItem();
     test_GetDlgItemText();
     test_create_controls();
+    test_ansi_dialog_unicode_control_caption();
     test_DialogBoxParam();
     test_DisabledDialogTest();
     test_MessageBoxFontTest();
