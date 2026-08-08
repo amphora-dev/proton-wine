@@ -210,7 +210,7 @@ static BOOL DIALOG_CreateControls32( HWND hwnd, LPCSTR template, const DLG_TEMPL
             info.style &= ~WS_BORDER;
             info.exStyle |= WS_EX_CLIENTEDGE;
         }
-        if (unicode)
+        if (unicode || WIN_IsUnicodeClass( info.className, hInst ))
         {
             const WCHAR *caption = info.windowName;
             WCHAR caption_buf[3];
@@ -272,10 +272,6 @@ static BOOL DIALOG_CreateControls32( HWND hwnd, LPCSTR template, const DLG_TEMPL
                                         MulDiv(info.cy, dlgInfo->yBaseUnit, 8),
                                         hwnd, (HMENU)info.id,
                                         hInst, (LPVOID)info.data );
-            /* Windows preserves the UTF-16 template caption when an ANSI dialog
-             * creates a Unicode control (notably Common Controls v6). */
-            if (hwndCtrl && IsWindowUnicode( hwndCtrl ) && !IS_INTRESOURCE( info.windowName ))
-                SetWindowTextW( hwndCtrl, info.windowName );
             HeapFree( GetProcessHeap(), 0, class_tmp );
             HeapFree( GetProcessHeap(), 0, caption_tmp );
         }

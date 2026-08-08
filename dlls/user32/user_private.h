@@ -175,6 +175,7 @@ BOOL is_desktop_window( HWND hwnd );
 HWND WIN_GetFullHandle( HWND hwnd );
 HWND WIN_IsCurrentProcess( HWND hwnd );
 HWND WIN_IsCurrentThread( HWND hwnd );
+BOOL WIN_IsUnicodeClass( LPCWSTR className, HINSTANCE module );
 HWND WIN_CreateWindowEx( CREATESTRUCTW *cs, LPCWSTR className, HINSTANCE module, BOOL unicode );
 HWND *WIN_ListChildren( HWND hwnd );
 void MDI_CalcDefaultChildPos( HWND hwndClient, INT total, LPPOINT lpPos, INT delta, UINT *id );

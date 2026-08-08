@@ -276,6 +276,23 @@ static BOOL is_default_coord( int x )
 }
 
 /***********************************************************************
+ *           WIN_IsUnicodeClass
+ */
+BOOL WIN_IsUnicodeClass( LPCWSTR className, HINSTANCE module )
+{
+    WCHAR nameW[MAX_ATOM_LEN + 1];
+    UNICODE_STRING class = RTL_CONSTANT_STRING(nameW), version;
+    WNDCLASSEXW info;
+
+    init_class_name( &class, className );
+    get_class_version( &class, &version, TRUE );
+    if (!NtUserGetClassInfoEx( module, &class, &info, NULL, FALSE )) return FALSE;
+
+    return info.lpfnWndProc && (ULONG_PTR)info.lpfnWndProc >> 16 != (~0u >> 16);
+}
+
+
+/***********************************************************************
  *           WIN_CreateWindowEx
  *
  * Implementation of CreateWindowEx().
