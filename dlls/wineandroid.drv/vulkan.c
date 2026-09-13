@@ -30,6 +30,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -123,20 +124,41 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
                                                                              &android_vulkan_client_surface_funcs, hwnd )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* Amphora GDI posts via get_amphora_parent_window (sock proxy to host ANW).
-     * Attach VkSurfaceKHR to that same proxy so WSI dequeue/queue hits the
-     * identical SurfaceView buffer path — do not open a parallel ioctl client. */
+    /* Dedicated client ANW (CREATE_WINDOW opengl=1). Do NOT use the GDI parent
+     * (opengl=0) that desktop/winefile LOCK — that ANW is NATIVE_WINDOW_IN_USE. */
     if (amphora && amphora[0] == '1' && amphora[1] == '\0')
     {
-        surface->window = get_amphora_parent_window( hwnd );
-        if (surface->window)
+        struct ANativeWindow *tmp = create_ioctl_window( hwnd, TRUE, 1.0f );
+        int i;
+        /* Keep the ioctl wrapper alive: last-ref release sends DESTROY_WINDOW. */
+        if (!tmp)
+            ERR( "amphora vulkan hwnd=%p create_ioctl_window(client) failed\n", hwnd );
+        for (i = 0; i < 50 && !surface->window; i++)
         {
-            surface->window->common.incRef( &surface->window->common );
-            surface->amphora_parent = TRUE;
-            ERR( "amphora vulkan surface hwnd=%p anw=%p (parent/GDI path)\n", hwnd, surface->window );
+            surface->window = get_amphora_client_window( hwnd );
+            if (surface->window)
+            {
+                surface->window->common.incRef( &surface->window->common );
+                surface->amphora_parent = TRUE;
+                ERR( "amphora vulkan own ANW hwnd=%p anw=%p (client/opengl, not GDI parent)\n",
+                     hwnd, surface->window );
+                break;
+            }
+            usleep( 40000 );
         }
-        else
-            ERR( "amphora vulkan surface hwnd=%p no parent ANW yet\n", hwnd );
+        if (!surface->window)
+            ERR( "amphora vulkan hwnd=%p no client ANW after wait\n", hwnd );
+    }
+
+    if (surface->window && surface->amphora_parent)
+    {
+        INT32 vkret[4] = { -999, -999, -999, -999 };
+        int pret = amphora_parent_vk_present( surface->window, vkret );
+        ERR( "amphora host WSI hwnd=%p own-anw surface=%d swap=%d present=%d sock=%d\n",
+             hwnd, vkret[0], vkret[1], vkret[2], pret );
+        ERR( "amphora skip PE WSI after own-ANW present hwnd=%p\n", hwnd );
+        client_surface_release( &surface->client );
+        return (pret == 0 || pret == 1) ? VK_ERROR_OUT_OF_DATE_KHR : VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
     }
 
     if (!surface->window)

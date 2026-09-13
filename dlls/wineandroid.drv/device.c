@@ -337,13 +337,23 @@ static int amphora_parent_get_sock( struct ANativeWindow *win );
 
 /* Amphora GDI flush: return parent ANW (mmap LOCK path), not ioctl/gralloc wrapper.
  * Out-of-process clients import the buffer sock from the device process on first use. */
-static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd );
+static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd, BOOL opengl );
+
 struct ANativeWindow *get_amphora_parent_window( HWND hwnd )
 {
     struct native_win_data *data = get_native_win_data( hwnd, FALSE );
     if (data && data->parent) return data->parent;
     if (!is_in_desktop_process())
-        return amphora_import_parent_from_device( hwnd );
+        return amphora_import_parent_from_device( hwnd, FALSE );
+    return data ? data->parent : NULL;
+}
+
+struct ANativeWindow *get_amphora_client_window( HWND hwnd )
+{
+    struct native_win_data *data = get_native_win_data( hwnd, TRUE );
+    if (data && data->parent) return data->parent;
+    if (!is_in_desktop_process())
+        return amphora_import_parent_from_device( hwnd, TRUE );
     return data ? data->parent : NULL;
 }
 
@@ -813,6 +823,7 @@ static void create_desktop_window( HWND hwnd )
 #define AMPHORA_BUF_QUERY     4
 #define AMPHORA_BUF_PERFORM   5
 #define AMPHORA_BUF_SET_SWAP  6
+#define AMPHORA_BUF_VK_PRESENT 7
 
 static int amphora_host_fd = -1;
 static int amphora_mode;
@@ -1371,6 +1382,44 @@ static int amphora_parent_perform( struct ANativeWindow *window, int operation, 
     }
     pthread_mutex_unlock( &win->lock );
     return ret;
+}
+
+int amphora_parent_vk_present( struct ANativeWindow *window, INT32 reply[4] )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    INT32 cmd = AMPHORA_BUF_VK_PRESENT;
+    INT32 local[4] = { -1, -1, -1, -1 };
+
+    if (!win || win->sock < 0) return -EBADF;
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_read_full( win->sock, local, sizeof(local) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    if (reply) memcpy( reply, local, sizeof(local) );
+    return local[2];
+}
+
+int amphora_parent_fill_rgba( struct ANativeWindow *window, unsigned int rgba )
+{
+    ANativeWindow_Buffer buffer;
+    ARect rc;
+    int ret, i, n;
+    unsigned int *bits;
+
+    if (!window || !window->perform) return -EINVAL;
+    memset( &buffer, 0, sizeof(buffer) );
+    memset( &rc, 0, sizeof(rc) );
+    ret = window->perform( window, NATIVE_WINDOW_LOCK, &buffer, &rc );
+    if (ret || !buffer.bits) return ret ? ret : -EIO;
+    n = buffer.stride * buffer.height;
+    bits = buffer.bits;
+    for (i = 0; i < n; i++) bits[i] = rgba;
+    window->perform( window, NATIVE_WINDOW_UNLOCK_AND_POST );
+    return 0;
 }
 
 static int amphora_parent_get_sock( struct ANativeWindow *win )
@@ -2491,7 +2540,7 @@ static int perform( ANativeWindow *window, int operation, ... )
 }
 
 /* Client-side: pull Amphora buffer sock from device process and install local parent. */
-static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
+static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd, BOOL opengl )
 {
     struct ioctl_android_fetch_amphora_parent req;
     struct native_win_data *data;
@@ -2502,7 +2551,7 @@ static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
 
     memset( &req, 0, sizeof(req) );
     req.hdr.hwnd = HandleToLong( hwnd );
-    req.hdr.opengl = FALSE;
+    req.hdr.opengl = opengl;
     /* METHOD_BUFFERED needs in_size >= out payload so sock_handle is copied back. */
     status = android_ioctl( IOCTL_FETCH_AMPHORA_PARENT, &req, sizeof(req), &req, &size );
     if (status || size < sizeof(req) || req.sock_handle <= 0)
@@ -2521,12 +2570,12 @@ static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
     }
     NtClose( LongToHandle( req.sock_handle ) );
 
-    if (!(data = create_native_win_data( hwnd, FALSE )))
+    if (!(data = create_native_win_data( hwnd, opengl )))
     {
         close( fd );
         return NULL;
     }
-    parent = amphora_create_parent( fd, hwnd, FALSE );
+    parent = amphora_create_parent( fd, hwnd, opengl );
     if (!parent)
     {
         free_native_win_data( data );
