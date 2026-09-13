@@ -86,7 +86,7 @@ void init_monitors( int width, int height )
            wine_dbgstr_rect( &rect ), wine_dbgstr_rect( &monitor_rc_work ));
 
     /* if we're notified from Java thread, update registry */
-    if (*p_java_vm) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
+    if (p_java_vm && *p_java_vm) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
 }
 
 
@@ -170,7 +170,7 @@ void set_screen_dpi( DWORD dpi )
  */
 static void fetch_display_metrics(void)
 {
-    if (*p_java_vm) return;  /* for Java threads it will be set when the top view is created */
+    if (p_java_vm && *p_java_vm) return;  /* for Java threads it will be set when the top view is created */
 
     SERVER_START_REQ( get_window_rectangles )
     {
