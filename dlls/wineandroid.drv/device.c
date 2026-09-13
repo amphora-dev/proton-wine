@@ -531,7 +531,14 @@ static struct native_win_data *create_native_win_data( HWND hwnd, BOOL opengl )
     data->hwnd = hwnd;
     data->opengl = opengl;
     if (!opengl) data->api = NATIVE_WINDOW_API_CPU;
-    data->buffer_format = PF_BGRA_8888;
+    {
+        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+        /* SwiftShader / SF RenderEngine reject AHardwareBuffer format 5 (BGRA). */
+        if (amphora && amphora[0] == '1')
+            data->buffer_format = PF_RGBA_8888;
+        else
+            data->buffer_format = PF_BGRA_8888;
+    }
     data_map[idx] = data;
     for (i = 0; i < NB_CACHED_BUFFERS; i++) data->buffer_lru[i] = -1;
     return data;
@@ -571,6 +578,10 @@ NTSTATUS android_register_window( void *arg )
     data->generation++;
     wrap_java_call();
     if (data->api) win->perform( win, NATIVE_WINDOW_API_CONNECT, data->api );
+    ERR( "amphora SET_BUFFERS_FORMAT hwnd=%p format=%d (%s)\n",
+         hwnd, data->buffer_format,
+         data->buffer_format == PF_RGBA_8888 ? "RGBA_8888" :
+         data->buffer_format == PF_BGRA_8888 ? "BGRA_8888" : "other" );
     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
     win->setSwapInterval( win, data->swap_interval );
     unwrap_java_call();
