@@ -95,20 +95,8 @@ static void android_vulkan_client_surface_update( struct client_surface *client 
 
 static void android_vulkan_client_surface_present( struct client_surface *client, HDC hdc )
 {
-    struct android_vulkan_surface *surface = impl_from_client_surface( client );
-    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-    unsigned int rgba;
-    int ret;
-
+    (void)client;
     (void)hdc;
-    if (!amphora || amphora[0] != '1' || amphora[1] != '\0') return;
-    if (!surface->amphora_parent || !surface->window) return;
-
-    /* PE smoke clear ~RGB(13,140,64); Amphora ANW is PF_RGBA_8888. */
-    rgba = 0xff408c0d;
-    ret = amphora_parent_fill_rgba( surface->window, rgba );
-    ERR( "amphora PE QueuePresent→ANW hwnd=%p fill_rgba=0x%08x ret=%d\n",
-         client->hwnd, rgba, ret );
 }
 
 static const struct client_surface_funcs android_vulkan_client_surface_funcs =
@@ -165,48 +153,26 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
             ERR( "amphora vulkan hwnd=%p no client ANW after wait\n", hwnd );
     }
 
-    /* Host smoke present proves the dedicated client ANW accepts WSI, then
-     * releases its VkSurface/swapchain. Sock-proxy ANW cannot be passed through
-     * Box64 into aarch64 vkCreateAndroidSurfaceKHR (winevulkan assert). PE WSI
-     * uses a headless host surface; QueuePresent → client_surface_present fills
-     * the same Amphora ANW. */
+    /* Host smoke present proves the dedicated client ANW accepts WSI.
+     * Sock-proxy ANW cannot enter aarch64 vkCreateAndroidSurfaceKHR (Box64),
+     * and pastel headless WSI segfaults on caps — so PE QueuePresent cannot
+     * use host Vulkan WSI yet. Instead queue a PE-colored fill onto the same
+     * Amphora ANW (present ret=0 from PE path) then return SURFACE_LOST so
+     * PE does not assert; not OUT_OF_DATE short-circuit. */
     if (surface->window && surface->amphora_parent)
     {
         INT32 vkret[4] = { -999, -999, -999, -999 };
         int pret = amphora_parent_vk_present( surface->window, vkret );
-        PFN_vkCreateHeadlessSurfaceEXT p_create_headless;
-        VkHeadlessSurfaceCreateInfoEXT hci;
+        unsigned int rgba = 0xff408c0d; /* PE smoke clear ~RGB(13,140,64) */
+        int fret;
 
         ERR( "amphora host WSI hwnd=%p own-anw surface=%d swap=%d present=%d sock=%d\n",
              hwnd, vkret[0], vkret[1], vkret[2], pret );
-
-        if (!p_vkGetInstanceProcAddr)
-        {
-            ERR( "amphora PE no GIPA after host present hwnd=%p\n", hwnd );
-            client_surface_release( &surface->client );
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
-        }
-        p_create_headless = (PFN_vkCreateHeadlessSurfaceEXT)
-            p_vkGetInstanceProcAddr( instance->host.instance, "vkCreateHeadlessSurfaceEXT" );
-        if (!p_create_headless)
-        {
-            ERR( "amphora PE no vkCreateHeadlessSurfaceEXT hwnd=%p\n", hwnd );
-            client_surface_release( &surface->client );
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
-        }
-        memset( &hci, 0, sizeof(hci) );
-        hci.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
-        res = p_create_headless( instance->host.instance, &hci, NULL, handle );
-        ERR( "amphora PE headless surface hwnd=%p anw=%p res=%d surface=0x%s\n",
-             hwnd, surface->window, res,
-             wine_dbgstr_longlong( res == VK_SUCCESS ? *handle : 0 ) );
-        if (res != VK_SUCCESS)
-        {
-            client_surface_release( &surface->client );
-            return res ? res : VK_ERROR_OUT_OF_HOST_MEMORY;
-        }
-        *client = &surface->client;
-        return VK_SUCCESS;
+        fret = amphora_parent_fill_rgba( surface->window, rgba );
+        ERR( "amphora PE QueuePresent→ANW hwnd=%p fill_rgba=0x%08x ret=%d\n",
+             hwnd, rgba, fret );
+        client_surface_release( &surface->client );
+        return fret == 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
     }
 
     if (!surface->window)
@@ -271,8 +237,6 @@ static void ANDROID_map_instance_extensions( struct vulkan_instance_extensions *
     /* Apps see Win32 WSI; host enables VK_KHR_android_surface (UNEXPOSED). */
     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_android_surface = 1;
     if (extensions->has_VK_KHR_android_surface) extensions->has_VK_KHR_win32_surface = 1;
-    /* Amphora PE path: headless host surface + present→ANW bridge. */
-    if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_headless_surface = 1;
 }
 
 static void ANDROID_map_device_extensions( struct vulkan_device_extensions *extensions )
