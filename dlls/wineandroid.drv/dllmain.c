@@ -139,10 +139,21 @@ static NTSTATUS WINAPI android_start_device(void *param, ULONG size)
 }
 
 
+/* PE-side mirror of WM_ANDROID_REFRESH (unix android.h); see ntuser.h WM_WINE_FIRST_DRIVER_MSG. */
+#ifndef WM_ANDROID_REFRESH
+#define WM_ANDROID_REFRESH WM_WINE_FIRST_DRIVER_MSG
+#endif
+
 static void CALLBACK register_window_callback( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3 )
 {
     struct register_window_params params = { .arg1 = arg1, .arg2 = arg2, .arg3 = arg3 };
+    HWND hwnd = (HWND)arg1;
+
     ANDROID_CALL( register_window, &params );
+    /* Unix NtUserPostMessage from ANDROID_CALL did not reach ANDROID_WindowMessage;
+     * post from PE after the register call so the driver hook can flush GDI. */
+    ERR( "amphora register_window posted-from-PE hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
+    NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, arg3, 0 );
 }
 
 

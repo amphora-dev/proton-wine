@@ -538,9 +538,9 @@ NTSTATUS android_register_window( void *arg )
         pANativeWindow_release( win );
         if (data)
         {
-            ERR( "amphora register_window posted REFRESH hwnd=%p opengl=%d (unchanged)\n",
+            /* PE register_window_callback posts WM_ANDROID_REFRESH after ANDROID_CALL. */
+            ERR( "amphora register_window defer REFRESH to PE hwnd=%p opengl=%d (unchanged)\n",
                  hwnd, opengl );
-            NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, opengl, 0 );
         }
         TRACE( "%p -> %p win %p (unchanged)\n", hwnd, data, win );
         return 0;
@@ -554,8 +554,8 @@ NTSTATUS android_register_window( void *arg )
     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
     win->setSwapInterval( win, data->swap_interval );
     unwrap_java_call();
-    ERR( "amphora register_window posted REFRESH hwnd=%p opengl=%d\n", hwnd, opengl );
-    NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, opengl, 0 );
+    /* PE register_window_callback posts WM_ANDROID_REFRESH after ANDROID_CALL. */
+    ERR( "amphora register_window defer REFRESH to PE hwnd=%p opengl=%d\n", hwnd, opengl );
     TRACE( "%p -> %p win %p\n", hwnd, data, win );
     return 0;
 }
