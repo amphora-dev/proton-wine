@@ -610,6 +610,9 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
     rc.right  = dirty->right;
     rc.bottom = dirty->bottom;
 
+    ERR( "amphora surface_flush LOCK hwnd=%p dirty=(%d,%d)-(%d,%d)\n",
+         window_surface->hwnd, dirty->left, dirty->top, dirty->right, dirty->bottom );
+
     if (!surface->window->perform( surface->window, NATIVE_WINDOW_LOCK, &buffer, &rc ))
     {
         const RECT *rgn_rect = surface->clip_rects, *end = surface->clip_rects + surface->clip_count;
@@ -657,9 +660,10 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
             dst += buffer.stride;
         }
         surface->window->perform( surface->window, NATIVE_WINDOW_UNLOCK_AND_POST );
+        ERR( "amphora surface_flush UNLOCK_AND_POST hwnd=%p\n", window_surface->hwnd );
     }
-    else TRACE( "Unable to lock surface %p window %p buffer %p\n",
-                surface, window_surface->hwnd, surface->window );
+    else ERR( "amphora Unable to lock surface %p window %p buffer %p\n",
+              surface, window_surface->hwnd, surface->window );
 
     return TRUE;
 }
@@ -1209,7 +1213,17 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         }
         else
         {
-            NtUserExposeWindowSurface( hwnd, 0, NULL, 0 );
+            BOOL exposed, redrawn;
+
+            ERR( "amphora WM_ANDROID_REFRESH hwnd=%p (GDI expose+invalidate)\n", hwnd );
+            exposed = NtUserExposeWindowSurface( hwnd, 0, NULL, 0 );
+            if (!exposed)
+                ERR( "amphora ExposeWindowSurface failed hwnd=%p\n", hwnd );
+            /* Expose alone is a no-op on a clean surface; force a GDI flush via LOCK. */
+            redrawn = NtUserRedrawWindow( hwnd, NULL, 0,
+                                          RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW );
+            if (!redrawn)
+                ERR( "amphora RedrawWindow failed hwnd=%p\n", hwnd );
         }
         return 0;
     default:
