@@ -1961,8 +1961,24 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
                                FILE_NON_DIRECTORY_FILE, NULL, 0 );
         if (status)
         {
-            ERR( "amphora android_ioctl NtCreateFile WineAndroid status=%lx\n", status );
-            return -ENOENT;
+            const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+            if (amphora && amphora[0] == '1' && amphora[1] == '\0')
+            {
+                int i;
+                /* Device thread may still be in IoCreateDriver; retry briefly. */
+                for (i = 0; i < 50 && status; i++)
+                {
+                    usleep( 10000 ); /* 10ms */
+                    status = NtCreateFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+                                           FILE_NON_DIRECTORY_FILE, NULL, 0 );
+                }
+            }
+            if (status)
+            {
+                ERR( "amphora android_ioctl NtCreateFile WineAndroid status=%lx\n", status );
+                return -ENOENT;
+            }
         }
         if (InterlockedCompareExchangePointer( &device, file, NULL )) NtClose( file );
     }

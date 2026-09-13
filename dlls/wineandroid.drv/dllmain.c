@@ -103,9 +103,21 @@ static NTSTATUS WINAPI android_start_device(void *param, ULONG size)
 {
     HANDLE handles[2];
     DWORD wait_ret;
+    char amphora[4];
+    BOOL amphora_mode = (GetEnvironmentVariableA( "AMPHORA_WINEANDROID", amphora, sizeof(amphora) )
+                         && amphora[0] == '1' && amphora[1] == '\0');
 
     handles[0] = CreateEventW( NULL, TRUE, FALSE, NULL );
     handles[1] = CreateThread( NULL, 0, device_thread, handles[0], 0, NULL );
+    if (amphora_mode)
+    {
+        /* Amphora: do not block CreateWindow on INFINITE Wait — return the thread
+         * handle immediately so alloc_win_data can run while device_thread
+         * finishes IoCreateDriver. Keep start event open (device_thread SetEvent). */
+        ERR( "amphora android_start_device Amphora skip Wait, before NtCallbackReturn thread=%p\n",
+             handles[1] );
+        return NtCallbackReturn( &handles[1], sizeof(handles[1]), STATUS_SUCCESS );
+    }
     wait_ret = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
     ERR( "amphora android_start_device WaitForMultipleObjects woke wait_ret=%lu handles={%p,%p}\n",
          wait_ret, handles[0], handles[1] );
