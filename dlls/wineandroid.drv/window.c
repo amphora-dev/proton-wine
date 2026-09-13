@@ -1240,6 +1240,24 @@ BOOL has_client_surface( HWND hwnd )
  */
 BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
 {
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+
+    /* Amphora: explorer CreateDesktop runs before CreateWindow(desktop), so
+     * desktop_tid / event_pipe are unset. Waiting for a Java SURFACE_CHANGED
+     * would assert in wait_events. Use the desktop size from the command line;
+     * HOST_DESKTOP_CHANGED can refine it after host.sock connects. */
+    if (amphora && amphora[0] == '1' && amphora[1] == '\0')
+    {
+        if (!screen_width && width && height)
+        {
+            screen_width = width;
+            screen_height = height;
+            init_monitors( width, height );
+            ERR( "amphora CreateDesktop %ux%u, skip Java surface wait\n", width, height );
+        }
+        return 0;
+    }
+
     /* wait until we receive the surface changed event */
     while (!screen_width)
     {
