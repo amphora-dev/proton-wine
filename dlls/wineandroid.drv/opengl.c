@@ -77,9 +77,9 @@ static void android_drawable_destroy( struct opengl_drawable *base )
 
 void update_gl_drawable( HWND hwnd )
 {
-    /* clear any cached opengl drawable */
-    set_window_opengl_drawable( hwnd, NULL, TRUE );
-    set_window_opengl_drawable( hwnd, NULL, FALSE );
+    /* Proton pin keeps set_window_opengl_drawable private in win32u.
+     * Use the exported client-surface detach (same path as WM_ANDROID_REFRESH). */
+    detach_client_surfaces( hwnd );
     NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE );
 }
 
