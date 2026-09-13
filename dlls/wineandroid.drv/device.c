@@ -76,6 +76,7 @@ enum android_ioctl
     IOCTL_SET_SWAP_INT,
     IOCTL_SET_CAPTURE,
     IOCTL_SET_CURSOR,
+    IOCTL_FETCH_AMPHORA_PARENT,
     NB_IOCTLS
 };
 
@@ -103,6 +104,7 @@ struct native_win_data
     int                         buffer_format;
     int                         swap_interval;
     int                         buffer_lru[NB_CACHED_BUFFERS];
+    int                         amphora_sock; /* device-side buffer sock for out-of-proc import */
 };
 
 /* wrapper for a native window in the context of the client (non-Java) process */
@@ -198,6 +200,12 @@ struct ioctl_android_perform
     struct ioctl_header hdr;
     int                 operation;
     int                 args[4];
+};
+
+struct ioctl_android_fetch_amphora_parent
+{
+    struct ioctl_header hdr;
+    int sock_handle; /* Wine handle to dup'd buffer sock for client */
 };
 
 struct ioctl_android_set_swap_interval
@@ -325,10 +333,15 @@ static struct native_win_data *get_native_win_data( HWND hwnd, BOOL opengl )
     return NULL;
 }
 
-/* Amphora GDI flush: return parent ANW (mmap LOCK path), not ioctl/gralloc wrapper. */
+/* Amphora GDI flush: return parent ANW (mmap LOCK path), not ioctl/gralloc wrapper.
+ * Out-of-process clients import the buffer sock from the device process on first use. */
+static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd );
 struct ANativeWindow *get_amphora_parent_window( HWND hwnd )
 {
     struct native_win_data *data = get_native_win_data( hwnd, FALSE );
+    if (data && data->parent) return data->parent;
+    if (!is_in_desktop_process())
+        return amphora_import_parent_from_device( hwnd );
     return data ? data->parent : NULL;
 }
 
@@ -503,6 +516,7 @@ static void release_native_window( struct native_win_data *data )
 {
     unsigned int i;
 
+    data->amphora_sock = -1; /* owned by parent ANW; closed on release */
     if (data->parent) pANativeWindow_release( data->parent );
     for (i = 0; i < NB_CACHED_BUFFERS; i++)
     {
@@ -537,6 +551,7 @@ static struct native_win_data *create_native_win_data( HWND hwnd, BOOL opengl )
     if (!(data = calloc( 1, sizeof(*data) ))) return NULL;
     data->hwnd = hwnd;
     data->opengl = opengl;
+    data->amphora_sock = -1;
     if (!opengl) data->api = NATIVE_WINDOW_API_CPU;
     {
         const char *amphora = getenv( "AMPHORA_WINEANDROID" );
@@ -1448,8 +1463,11 @@ NTSTATUS android_host_reader( void *arg )
                 for (i = 1; i < n_fds; i++) close( fds[i] );
                 if (parent)
                 {
-                    TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d %dx%d fd parent %p\n",
-                           hwnd, opengl, width, height, parent );
+                    struct native_win_data *nd = get_native_win_data( LongToHandle( hwnd ), opengl );
+                    struct amphora_parent_window *aw = (struct amphora_parent_window *)parent;
+                    if (nd) nd->amphora_sock = aw->sock;
+                    TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d %dx%d fd parent %p sock %d\n",
+                           hwnd, opengl, width, height, parent, aw->sock );
                     register_native_window( LongToHandle( hwnd ), parent, opengl );
                 }
                 else
@@ -1733,20 +1751,10 @@ static NTSTATUS queueBuffer_ioctl( void *data, DWORD in_size, DWORD out_size, UL
     if (win_data->mappings[res->buffer_id])
     {
         void *bits;
-        int amphora_mapped = 0;
         ret = gralloc_lock( buffer, &bits );
-        if (ret)
-        {
-            /* Amphora: no gralloc HAL — mmap ANW native_handle like parent LOCK. */
-            ret = amphora_mmap_buffer( buffer, &bits );
-            amphora_mapped = !ret;
-        }
         if (ret) return android_error_to_status( ret );
         memcpy( bits, win_data->mappings[res->buffer_id], buffer->stride * buffer->height * 4 );
-        if (amphora_mapped)
-            amphora_munmap_buffer( buffer );
-        else
-            gralloc_unlock( buffer );
+        gralloc_unlock( buffer );
     }
     wrap_java_call();
     ret = parent->queueBuffer( parent, buffer, -1 );
@@ -1957,6 +1965,49 @@ static NTSTATUS setCursor_ioctl( void *data, DWORD in_size, DWORD out_size, ULON
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS fetchAmphoraParent_ioctl( void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size )
+{
+    struct ioctl_android_fetch_amphora_parent *res = data;
+    struct native_win_data *win_data;
+    OBJECT_ATTRIBUTES attr = { .Length = sizeof(attr) };
+    CLIENT_ID cid = { .UniqueProcess = UlongToHandle( current_client_id() ) };
+    HANDLE process = 0;
+    int handle;
+
+    if (in_size < sizeof(res->hdr) || out_size < sizeof(*res))
+        return STATUS_BUFFER_OVERFLOW;
+    if (!(win_data = get_ioctl_native_win_data( &res->hdr )))
+        return STATUS_INVALID_HANDLE;
+    if (win_data->amphora_sock < 0 || !win_data->parent)
+        return STATUS_DEVICE_NOT_READY;
+
+    NtOpenProcess( &process, PROCESS_DUP_HANDLE, &attr, &cid );
+    {
+        HANDLE wh = 0, ret = 0;
+        int d = dup( win_data->amphora_sock );
+        if (d < 0 || wine_server_fd_to_handle( d, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0, &wh ))
+        {
+            if (d >= 0) close( d );
+            NtClose( process );
+            ERR( "amphora fetch parent fd_to_handle failed hwnd=%08x\n", res->hdr.hwnd );
+            return STATUS_UNSUCCESSFUL;
+        }
+        NtDuplicateObject( GetCurrentProcess(), wh, process, &ret,
+                           0, 0, DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE );
+        NtClose( process );
+        if (!ret)
+        {
+            ERR( "amphora fetch parent DupHandle failed hwnd=%08x\n", res->hdr.hwnd );
+            return STATUS_UNSUCCESSFUL;
+        }
+        handle = HandleToLong( ret );
+    }
+    res->sock_handle = handle;
+    *ret_size = sizeof(*res);
+    ERR( "amphora fetch parent hwnd=%08x sock_handle=%d\n", res->hdr.hwnd, handle );
+    return STATUS_SUCCESS;
+}
+
 typedef NTSTATUS (*ioctl_func)( void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size );
 static const ioctl_func ioctl_funcs[] =
 {
@@ -1972,6 +2023,7 @@ static const ioctl_func ioctl_funcs[] =
     setSwapInterval_ioctl,      /* IOCTL_SET_SWAP_INT */
     setCapture_ioctl,           /* IOCTL_SET_CAPTURE */
     setCursor_ioctl,            /* IOCTL_SET_CURSOR */
+    fetchAmphoraParent_ioctl,   /* IOCTL_FETCH_AMPHORA_PARENT */
 };
 
 NTSTATUS android_dispatch_ioctl( void *arg )
@@ -2362,11 +2414,7 @@ static int perform( ANativeWindow *window, int operation, ... )
         int ret = window->dequeueBuffer_DEPRECATED( window, &buffer );
         if (!ret)
         {
-            struct native_buffer_wrapper *buf = (struct native_buffer_wrapper *)buffer;
-            /* Amphora / no-gralloc: dequeue already mapped win32 section into buf->bits. */
-            if (buf->bits)
-                buffer_ret->bits = buf->bits;
-            else if ((ret = gralloc_lock( buffer, &buffer_ret->bits )))
+            if ((ret = gralloc_lock( buffer, &buffer_ret->bits )))
             {
                 WARN( "gralloc->lock %p failed %d %s\n", win->hwnd, ret, strerror(-ret) );
                 window->cancelBuffer( window, buffer, -1 );
@@ -2396,9 +2444,7 @@ static int perform( ANativeWindow *window, int operation, ... )
         int ret = -EINVAL;
         if (win->locked_buffer)
         {
-            struct native_buffer_wrapper *buf = (struct native_buffer_wrapper *)win->locked_buffer;
-            if (!buf->bits)
-                gralloc_unlock( win->locked_buffer );
+            gralloc_unlock( win->locked_buffer );
             ret = window->queueBuffer( window, win->locked_buffer, -1 );
             win->locked_buffer = NULL;
         }
@@ -2418,6 +2464,57 @@ static int perform( ANativeWindow *window, int operation, ... )
     }
     va_end( args );
     return android_ioctl( IOCTL_PERFORM, &perf, sizeof(perf), NULL, NULL );
+}
+
+/* Client-side: pull Amphora buffer sock from device process and install local parent. */
+static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
+{
+    struct ioctl_android_fetch_amphora_parent req;
+    struct native_win_data *data;
+    DWORD size = sizeof(req);
+    int fd = -1;
+    struct ANativeWindow *parent;
+    NTSTATUS status;
+
+    memset( &req, 0, sizeof(req) );
+    req.hdr.hwnd = HandleToLong( hwnd );
+    req.hdr.opengl = FALSE;
+    status = android_ioctl( IOCTL_FETCH_AMPHORA_PARENT, &req, sizeof(req.hdr), &req, &size );
+    if (status || size < sizeof(req) || req.sock_handle <= 0)
+    {
+        WARN( "amphora import parent hwnd=%p status=%lx size=%lu handle=%d\n",
+              hwnd, (long)status, (unsigned long)size, req.sock_handle );
+        return NULL;
+    }
+    if (wine_server_handle_to_fd( LongToHandle( req.sock_handle ),
+                                  GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &fd, NULL ))
+    {
+        ERR( "amphora import parent hwnd=%p handle_to_fd failed handle=%d\n",
+             hwnd, req.sock_handle );
+        NtClose( LongToHandle( req.sock_handle ) );
+        return NULL;
+    }
+    NtClose( LongToHandle( req.sock_handle ) );
+
+    if (!(data = create_native_win_data( hwnd, FALSE )))
+    {
+        close( fd );
+        return NULL;
+    }
+    parent = amphora_create_parent( fd, hwnd, FALSE );
+    if (!parent)
+    {
+        free_native_win_data( data );
+        return NULL;
+    }
+    data->parent = parent;
+    data->amphora_sock = fd;
+    data->generation++;
+    /* Match device-side register: CPU API + RGBA format. */
+    if (data->api) parent->perform( parent, NATIVE_WINDOW_API_CONNECT, data->api );
+    parent->perform( parent, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
+    ERR( "amphora import parent bound hwnd=%p parent=%p sock=%d\n", hwnd, parent, fd );
+    return parent;
 }
 
 struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl, float scale )
