@@ -150,15 +150,16 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
             ERR( "amphora vulkan hwnd=%p no client ANW after wait\n", hwnd );
     }
 
+    /* Host smoke present proves the dedicated client ANW accepts WSI, then
+     * releases its VkSurface/swapchain. Fall through so PE winevulkan can
+     * vkCreateAndroidSurfaceKHR + QueuePresent on the same Amphora ANW. */
     if (surface->window && surface->amphora_parent)
     {
         INT32 vkret[4] = { -999, -999, -999, -999 };
         int pret = amphora_parent_vk_present( surface->window, vkret );
         ERR( "amphora host WSI hwnd=%p own-anw surface=%d swap=%d present=%d sock=%d\n",
              hwnd, vkret[0], vkret[1], vkret[2], pret );
-        ERR( "amphora skip PE WSI after own-ANW present hwnd=%p\n", hwnd );
-        client_surface_release( &surface->client );
-        return (pret == 0 || pret == 1) ? VK_ERROR_OUT_OF_DATE_KHR : VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+        ERR( "amphora PE WSI continue after host present hwnd=%p pret=%d\n", hwnd, pret );
     }
 
     if (!surface->window)
