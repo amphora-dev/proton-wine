@@ -1277,12 +1277,8 @@ static void amphora_apply_desktop( int width, int height )
 {
     if (width <= 0 || height <= 0) return;
 
-    /* Unblock ANDROID_CreateDesktop even before the event pipe exists.
-     * Avoid send_event here: p__android_log_print / event_pipe may be unset
-     * in Amphora (no JNI load_android_libs). */
     screen_width = width;
     screen_height = height;
-    init_monitors( width, height );
     TRACE( "HOST_DESKTOP_CHANGED %ux%u\n", width, height );
 }
 
