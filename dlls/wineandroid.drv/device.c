@@ -27,6 +27,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
@@ -735,11 +737,38 @@ static void create_desktop_window( HWND hwnd )
 
 /* Amphora host socket (AMPHORA_WINEANDROID=1): replace JNI WineActivity with AF_UNIX. */
 #define AMPHORA_HOST_SURFACE_CHANGED 100
+#define AMPHORA_HOST_DESKTOP_CHANGED 101
+
+#define AMPHORA_BUF_DEQUEUE   1
+#define AMPHORA_BUF_QUEUE     2
+#define AMPHORA_BUF_CANCEL    3
+#define AMPHORA_BUF_QUERY     4
+#define AMPHORA_BUF_PERFORM   5
+#define AMPHORA_BUF_SET_SWAP  6
 
 static int amphora_host_fd = -1;
 static int amphora_mode;
 static pthread_t amphora_reader_thread;
 static pthread_mutex_t amphora_send_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct amphora_parent_window
+{
+    struct ANativeWindow win;
+    int sock;
+    HWND hwnd;
+    BOOL opengl;
+    LONG ref;
+    pthread_mutex_t lock;
+    struct ANativeWindowBuffer *locked;
+    struct amphora_buf
+    {
+        struct ANativeWindowBuffer buffer;
+        native_handle_t *handle;
+        int buffer_id;
+        int generation;
+        LONG ref;
+    } *bufs[NB_CACHED_BUFFERS];
+};
 
 static int amphora_write_full( int fd, const void *buf, size_t len )
 {
@@ -778,6 +807,57 @@ static int amphora_read_full( int fd, void *buf, size_t len )
         p += n;
         left -= n;
     }
+    return 0;
+}
+
+/* Read nbytes from fd via recvmsg, collecting optional SCM_RIGHTS fds. */
+static int amphora_recv_with_fds( int fd, void *buf, size_t len, int *out_fds, int max_fds, int *n_fds )
+{
+    char *p = buf;
+    size_t left = len;
+    int got_fds = 0;
+
+    if (n_fds) *n_fds = 0;
+
+    while (left)
+    {
+        struct msghdr msg;
+        struct iovec iov;
+        char control[CMSG_SPACE( sizeof(int) * 64 )];
+        struct cmsghdr *cmsg;
+        ssize_t n;
+
+        memset( &msg, 0, sizeof(msg) );
+        iov.iov_base = p;
+        iov.iov_len = left;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        n = recvmsg( fd, &msg, 0 );
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!n) return -1;
+
+        for (cmsg = CMSG_FIRSTHDR( &msg ); cmsg; cmsg = CMSG_NXTHDR( &msg, cmsg ))
+        {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
+            {
+                int cnt = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                int i;
+                for (i = 0; i < cnt && got_fds < max_fds; i++)
+                    out_fds[got_fds++] = ((int *)CMSG_DATA( cmsg ))[i];
+            }
+        }
+
+        p += n;
+        left -= n;
+    }
+    if (n_fds) *n_fds = got_fds;
     return 0;
 }
 
@@ -820,6 +900,392 @@ static NTSTATUS amphora_send_window_ioctl_with_pid( enum android_ioctl code, con
     return amphora_send_frame( code, buf, total );
 }
 
+static void amphora_buf_inc( struct android_native_base_t *base )
+{
+    struct amphora_parent_window *unused;
+    struct amphora_buf *buf = (struct amphora_buf *)base;
+    (void)unused;
+    InterlockedIncrement( &buf->ref );
+}
+
+static void amphora_buf_dec( struct android_native_base_t *base )
+{
+    struct amphora_buf *buf = (struct amphora_buf *)base;
+    if (InterlockedDecrement( &buf->ref ) > 0) return;
+    if (buf->handle) close_native_handle( buf->handle );
+    free( buf );
+}
+
+static void amphora_parent_inc( struct android_native_base_t *base )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)base;
+    InterlockedIncrement( &win->ref );
+}
+
+static void amphora_parent_dec( struct android_native_base_t *base )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)base;
+    unsigned int i;
+    if (InterlockedDecrement( &win->ref ) > 0) return;
+    for (i = 0; i < NB_CACHED_BUFFERS; i++)
+        if (win->bufs[i]) win->bufs[i]->buffer.common.decRef( &win->bufs[i]->buffer.common );
+    if (win->sock >= 0) close( win->sock );
+    pthread_mutex_destroy( &win->lock );
+    free( win );
+}
+
+static int amphora_parent_dequeue( struct ANativeWindow *window, struct ANativeWindowBuffer **out, int *fence )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    int32_t cmd = AMPHORA_BUF_DEQUEUE;
+    struct
+    {
+        int32_t status;
+        int32_t width, height, stride, format, usage;
+        int32_t buffer_id, generation;
+        int32_t numFds, numInts;
+    } hdr;
+    int fds[64];
+    int n_fds = 0;
+    int *ints = NULL;
+    native_handle_t *nh;
+    struct amphora_buf *buf;
+    size_t nh_size;
+
+    if (fence) *fence = -1;
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    if (amphora_recv_with_fds( win->sock, &hdr, sizeof(hdr), fds, 64, &n_fds ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    if (hdr.status)
+    {
+        pthread_mutex_unlock( &win->lock );
+        return hdr.status;
+    }
+    if (hdr.numFds < 0 || hdr.numInts < 0 || hdr.numFds > 64 || hdr.numInts > 256)
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EINVAL;
+    }
+    if (n_fds != hdr.numFds)
+    {
+        int i;
+        WARN( "amphora dequeue fd count mismatch got %d expected %d\n", n_fds, hdr.numFds );
+        for (i = 0; i < n_fds; i++) close( fds[i] );
+        pthread_mutex_unlock( &win->lock );
+        return -EINVAL;
+    }
+    if (hdr.numInts)
+    {
+        ints = malloc( sizeof(int) * hdr.numInts );
+        if (!ints || amphora_read_full( win->sock, ints, sizeof(int) * hdr.numInts ))
+        {
+            int i;
+            free( ints );
+            for (i = 0; i < n_fds; i++) close( fds[i] );
+            pthread_mutex_unlock( &win->lock );
+            return -EIO;
+        }
+    }
+
+    nh_size = offsetof( native_handle_t, data[hdr.numFds + hdr.numInts] );
+    nh = malloc( nh_size );
+    buf = calloc( 1, sizeof(*buf) );
+    if (!nh || !buf)
+    {
+        int i;
+        free( nh );
+        free( buf );
+        free( ints );
+        for (i = 0; i < n_fds; i++) close( fds[i] );
+        pthread_mutex_unlock( &win->lock );
+        return -ENOMEM;
+    }
+    nh->version = sizeof(*nh);
+    nh->numFds = hdr.numFds;
+    nh->numInts = hdr.numInts;
+    if (hdr.numFds) memcpy( nh->data, fds, sizeof(int) * hdr.numFds );
+    if (hdr.numInts) memcpy( nh->data + hdr.numFds, ints, sizeof(int) * hdr.numInts );
+    free( ints );
+
+    buf->buffer.common.magic = ANDROID_NATIVE_BUFFER_MAGIC;
+    buf->buffer.common.version = sizeof(struct ANativeWindowBuffer);
+    buf->buffer.common.incRef = amphora_buf_inc;
+    buf->buffer.common.decRef = amphora_buf_dec;
+    buf->buffer.width = hdr.width;
+    buf->buffer.height = hdr.height;
+    buf->buffer.stride = hdr.stride;
+    buf->buffer.format = hdr.format;
+    buf->buffer.usage = hdr.usage;
+    buf->buffer.handle = nh;
+    buf->handle = nh;
+    buf->buffer_id = hdr.buffer_id;
+    buf->generation = hdr.generation;
+    buf->ref = 1;
+
+    if (hdr.buffer_id >= 0 && hdr.buffer_id < NB_CACHED_BUFFERS)
+    {
+        if (win->bufs[hdr.buffer_id])
+            win->bufs[hdr.buffer_id]->buffer.common.decRef( &win->bufs[hdr.buffer_id]->buffer.common );
+        win->bufs[hdr.buffer_id] = buf;
+        buf->buffer.common.incRef( &buf->buffer.common );
+    }
+
+    *out = &buf->buffer;
+    pthread_mutex_unlock( &win->lock );
+    return 0;
+}
+
+static int amphora_parent_queue( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fence )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    struct amphora_buf *buf = (struct amphora_buf *)buffer;
+    int32_t cmd = AMPHORA_BUF_QUEUE;
+    int32_t ret;
+
+    wait_fence_and_close( fence );
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_write_full( win->sock, &buf->buffer_id, sizeof(buf->buffer_id) ) ||
+        amphora_write_full( win->sock, &buf->generation, sizeof(buf->generation) ) ||
+        amphora_read_full( win->sock, &ret, sizeof(ret) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    return ret;
+}
+
+static int amphora_parent_cancel( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fence )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    struct amphora_buf *buf = (struct amphora_buf *)buffer;
+    int32_t cmd = AMPHORA_BUF_CANCEL;
+    int32_t ret;
+
+    wait_fence_and_close( fence );
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_write_full( win->sock, &buf->buffer_id, sizeof(buf->buffer_id) ) ||
+        amphora_write_full( win->sock, &buf->generation, sizeof(buf->generation) ) ||
+        amphora_read_full( win->sock, &ret, sizeof(ret) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    return ret;
+}
+
+static int amphora_parent_dequeue_dep( struct ANativeWindow *window, struct ANativeWindowBuffer **buffer )
+{
+    int fence, ret = amphora_parent_dequeue( window, buffer, &fence );
+    if (!ret) wait_fence_and_close( fence );
+    return ret;
+}
+
+static int amphora_parent_queue_dep( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer )
+{
+    return amphora_parent_queue( window, buffer, -1 );
+}
+
+static int amphora_parent_cancel_dep( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer )
+{
+    return amphora_parent_cancel( window, buffer, -1 );
+}
+
+static int amphora_parent_lock_dep( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer )
+{
+    (void)window;
+    (void)buffer;
+    return 0;
+}
+
+static int amphora_parent_query( const struct ANativeWindow *window, int what, int *value )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    int32_t cmd = AMPHORA_BUF_QUERY;
+    int32_t ret, v;
+
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_write_full( win->sock, &what, sizeof(what) ) ||
+        amphora_read_full( win->sock, &ret, sizeof(ret) ) ||
+        amphora_read_full( win->sock, &v, sizeof(v) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    if (!ret && value) *value = v;
+    return ret;
+}
+
+static int amphora_parent_set_swap( struct ANativeWindow *window, int interval )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    int32_t cmd = AMPHORA_BUF_SET_SWAP;
+    int32_t ret;
+
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_write_full( win->sock, &interval, sizeof(interval) ) ||
+        amphora_read_full( win->sock, &ret, sizeof(ret) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    return ret;
+}
+
+static int amphora_parent_perform( struct ANativeWindow *window, int operation, ... )
+{
+    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
+    int32_t cmd = AMPHORA_BUF_PERFORM;
+    int32_t op = operation, nargs = 0, args[4], ret;
+    va_list ap;
+
+    va_start( ap, operation );
+    switch (operation)
+    {
+    case NATIVE_WINDOW_SET_USAGE:
+    case NATIVE_WINDOW_SET_BUFFERS_TRANSFORM:
+    case NATIVE_WINDOW_SET_BUFFERS_FORMAT:
+    case NATIVE_WINDOW_SET_SCALING_MODE:
+    case NATIVE_WINDOW_API_CONNECT:
+    case NATIVE_WINDOW_API_DISCONNECT:
+    case NATIVE_WINDOW_SET_BUFFER_COUNT:
+        args[0] = va_arg( ap, int );
+        nargs = 1;
+        break;
+    case NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS:
+    case NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS:
+        args[0] = va_arg( ap, int );
+        args[1] = va_arg( ap, int );
+        nargs = 2;
+        break;
+    case NATIVE_WINDOW_SET_BUFFERS_GEOMETRY:
+        args[0] = va_arg( ap, int );
+        args[1] = va_arg( ap, int );
+        args[2] = va_arg( ap, int );
+        nargs = 3;
+        break;
+    case NATIVE_WINDOW_CONNECT:
+    case NATIVE_WINDOW_DISCONNECT:
+    case NATIVE_WINDOW_UNLOCK_AND_POST:
+        nargs = 0;
+        break;
+    case NATIVE_WINDOW_LOCK:
+    {
+        /* Match ioctl wrapper: dequeue + gralloc_lock locally. */
+        struct ANativeWindow_Buffer *buffer_ret = va_arg( ap, ANativeWindow_Buffer * );
+        ARect *bounds = va_arg( ap, ARect * );
+        struct ANativeWindowBuffer *buffer;
+        int r = amphora_parent_dequeue_dep( window, &buffer );
+        va_end( ap );
+        if (!r)
+        {
+            if ((r = gralloc_lock( buffer, &buffer_ret->bits )))
+                amphora_parent_cancel( window, buffer, -1 );
+            else
+            {
+                buffer_ret->width = buffer->width;
+                buffer_ret->height = buffer->height;
+                buffer_ret->stride = buffer->stride;
+                buffer_ret->format = buffer->format;
+                win->locked = buffer;
+                if (bounds)
+                {
+                    bounds->left = 0;
+                    bounds->top = 0;
+                    bounds->right = buffer->width;
+                    bounds->bottom = buffer->height;
+                }
+            }
+        }
+        return r;
+    }
+    default:
+        va_end( ap );
+        return -ENOENT;
+    }
+    va_end( ap );
+
+    if (operation == NATIVE_WINDOW_UNLOCK_AND_POST)
+    {
+        if (!win->locked) return -EINVAL;
+        gralloc_unlock( win->locked );
+        ret = amphora_parent_queue( window, win->locked, -1 );
+        win->locked = NULL;
+        return ret;
+    }
+
+    pthread_mutex_lock( &win->lock );
+    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
+        amphora_write_full( win->sock, &op, sizeof(op) ) ||
+        amphora_write_full( win->sock, &nargs, sizeof(nargs) ) ||
+        (nargs && amphora_write_full( win->sock, args, sizeof(int32_t) * nargs )) ||
+        amphora_read_full( win->sock, &ret, sizeof(ret) ))
+    {
+        pthread_mutex_unlock( &win->lock );
+        return -EIO;
+    }
+    pthread_mutex_unlock( &win->lock );
+    return ret;
+}
+
+static struct ANativeWindow *amphora_create_parent( int sock, HWND hwnd, BOOL opengl )
+{
+    struct amphora_parent_window *win = calloc( 1, sizeof(*win) );
+    if (!win)
+    {
+        close( sock );
+        return NULL;
+    }
+    win->win.common.magic = ANDROID_NATIVE_WINDOW_MAGIC;
+    win->win.common.version = sizeof(ANativeWindow);
+    win->win.common.incRef = amphora_parent_inc;
+    win->win.common.decRef = amphora_parent_dec;
+    win->win.setSwapInterval = amphora_parent_set_swap;
+    win->win.dequeueBuffer_DEPRECATED = amphora_parent_dequeue_dep;
+    win->win.lockBuffer_DEPRECATED = amphora_parent_lock_dep;
+    win->win.queueBuffer_DEPRECATED = amphora_parent_queue_dep;
+    win->win.query = amphora_parent_query;
+    win->win.perform = amphora_parent_perform;
+    win->win.cancelBuffer_DEPRECATED = amphora_parent_cancel_dep;
+    win->win.dequeueBuffer = amphora_parent_dequeue;
+    win->win.queueBuffer = amphora_parent_queue;
+    win->win.cancelBuffer = amphora_parent_cancel;
+    win->sock = sock;
+    win->hwnd = hwnd;
+    win->opengl = opengl;
+    win->ref = 1;
+    pthread_mutex_init( &win->lock, NULL );
+    return &win->win;
+}
+
+static void amphora_apply_desktop( int width, int height )
+{
+    if (width <= 0 || height <= 0) return;
+
+    /* Unblock ANDROID_CreateDesktop even before the event pipe exists.
+     * Avoid send_event here: p__android_log_print / event_pipe may be unset
+     * in Amphora (no JNI load_android_libs). */
+    screen_width = width;
+    screen_height = height;
+    init_monitors( width, height );
+    TRACE( "HOST_DESKTOP_CHANGED %ux%u\n", width, height );
+}
+
 static void *amphora_host_reader( void *arg )
 {
     int fd = amphora_host_fd;
@@ -828,11 +1294,14 @@ static void *amphora_host_reader( void *arg )
     for (;;)
     {
         int header[2];
-        int hwnd, opengl, ready;
+        int hwnd, opengl, ready, width, height;
         unsigned char payload[64];
         DWORD nbytes;
+        int fds[8];
+        int n_fds = 0;
 
-        if (amphora_read_full( fd, header, sizeof(header) )) break;
+        /* Use recvmsg so SCM_RIGHTS on SURFACE_CHANGED is not dropped (read() loses fds). */
+        if (amphora_recv_with_fds( fd, header, sizeof(header), fds, 8, &n_fds )) break;
         nbytes = header[1];
         if (nbytes > sizeof(payload))
         {
@@ -840,10 +1309,10 @@ static void *amphora_host_reader( void *arg )
                   header[0], (unsigned long)nbytes );
             break;
         }
-        if (nbytes && amphora_read_full( fd, payload, nbytes )) break;
 
         if (header[0] == AMPHORA_HOST_SURFACE_CHANGED)
         {
+            if (nbytes && amphora_read_full( fd, payload, nbytes )) break;
             if (nbytes < 12)
             {
                 WARN( "HOST_SURFACE_CHANGED short payload %lu\n", (unsigned long)nbytes );
@@ -852,11 +1321,62 @@ static void *amphora_host_reader( void *arg )
             memcpy( &hwnd, payload, 4 );
             memcpy( &opengl, payload + 4, 4 );
             memcpy( &ready, payload + 8, 4 );
-            /* No ANativeWindow fd this commit — cannot register_native_window yet. */
-            TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d ready %d (no fd; register_native_window TODO)\n",
-                   hwnd, opengl, ready );
+            width = height = 0;
+            if (nbytes >= 20)
+            {
+                memcpy( &width, payload + 12, 4 );
+                memcpy( &height, payload + 16, 4 );
+            }
+
+            if (!ready)
+            {
+                int i;
+                for (i = 0; i < n_fds; i++) close( fds[i] );
+                register_native_window( LongToHandle( hwnd ), NULL, opengl );
+                TRACE( "HOST_SURFACE_CHANGED hwnd %08x clear\n", hwnd );
+                continue;
+            }
+
+            if (n_fds >= 1)
+            {
+                struct ANativeWindow *parent = amphora_create_parent( fds[0], LongToHandle( hwnd ), opengl );
+                int i;
+                for (i = 1; i < n_fds; i++) close( fds[i] );
+                if (parent)
+                {
+                    TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d %dx%d fd parent %p\n",
+                           hwnd, opengl, width, height, parent );
+                    register_native_window( LongToHandle( hwnd ), parent, opengl );
+                }
+                else
+                    WARN( "HOST_SURFACE_CHANGED hwnd %08x failed to create parent\n", hwnd );
+            }
+            else
+            {
+                TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d ready %d (no fd)\n",
+                       hwnd, opengl, ready );
+            }
             continue;
         }
+
+        if (nbytes && amphora_read_full( fd, payload, nbytes )) break;
+
+        if (header[0] == AMPHORA_HOST_DESKTOP_CHANGED)
+        {
+            float scale;
+            if (nbytes < 12)
+            {
+                WARN( "HOST_DESKTOP_CHANGED short payload %lu\n", (unsigned long)nbytes );
+                continue;
+            }
+            memcpy( &width, payload, 4 );
+            memcpy( &height, payload + 4, 4 );
+            memcpy( &scale, payload + 8, 4 );
+            (void)scale;
+            amphora_apply_desktop( width, height );
+            continue;
+        }
+
         WARN( "ignored amphora host opcode %d nbytes %lu\n",
               header[0], (unsigned long)nbytes );
     }
