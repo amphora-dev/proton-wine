@@ -151,10 +151,9 @@ static void CALLBACK register_window_callback( ULONG_PTR arg1, ULONG_PTR arg2, U
 
     ERR( "amphora register_window PE-enter hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
     ANDROID_CALL( register_window, &params );
-    /* Unix/PE PostMessage did not reach ANDROID_WindowMessage; SendMessage from PE
-     * after register so the driver hook runs synchronously on the hwnd thread. */
-    ERR( "amphora register_window posted-from-PE hwnd=%p opengl=%lu (SendMessage)\n", hwnd, (unsigned long)arg3 );
-    NtUserMessageCall( hwnd, WM_ANDROID_REFRESH, arg3, 0, NULL, NtUserSendMessage, FALSE );
+    /* Post from PE after register (SendMessage deadlocks device_thread↔hwnd thread). */
+    ERR( "amphora register_window posted-from-PE hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
+    NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, arg3, 0 );
 }
 
 
