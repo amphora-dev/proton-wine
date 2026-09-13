@@ -89,8 +89,11 @@ static DWORD CALLBACK device_thread( void *arg )
     stop_event = CreateEventW( NULL, TRUE, FALSE, NULL );
     ERR( "amphora device_thread before SetEvent start_event=%p\n", start_event );
     SetEvent( start_event );
+    ERR( "amphora device_thread after SetEvent start_event=%p\n", start_event );
 
+    ERR( "amphora device_thread entered wine_ntoskrnl_main_loop stop_event=%p\n", stop_event );
     ret = wine_ntoskrnl_main_loop( stop_event );
+    ERR( "amphora device_thread returned wine_ntoskrnl_main_loop ret=%lx\n", ret );
 
     ANDROID_CALL( java_uninit, NULL );
     return ret;
@@ -99,11 +102,15 @@ static DWORD CALLBACK device_thread( void *arg )
 static NTSTATUS WINAPI android_start_device(void *param, ULONG size)
 {
     HANDLE handles[2];
+    DWORD wait_ret;
 
     handles[0] = CreateEventW( NULL, TRUE, FALSE, NULL );
     handles[1] = CreateThread( NULL, 0, device_thread, handles[0], 0, NULL );
-    WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+    wait_ret = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+    ERR( "amphora android_start_device WaitForMultipleObjects woke wait_ret=%lu handles={%p,%p}\n",
+         wait_ret, handles[0], handles[1] );
     CloseHandle( handles[0] );
+    ERR( "amphora android_start_device before NtCallbackReturn thread=%p\n", handles[1] );
     return NtCallbackReturn( &handles[1], sizeof(handles[1]), STATUS_SUCCESS );
 }
 
