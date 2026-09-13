@@ -613,17 +613,23 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
     rc.right  = dirty->right;
     rc.bottom = dirty->bottom;
 
-    /* Amphora: LOCK parent mmap ANW (same path as former probe), not ioctl/gralloc wrapper. */
+    /* Amphora: prefer local parent mmap ANW. Out-of-process windows (winefile) have
+     * parent bound only in the device/explorer data_map — fall back to ioctl wrapper
+     * (win32 section + device-side amphora mmap queue) instead of skipping. */
     if (amphora && amphora[0] == '1')
     {
         ANativeWindow *parent = get_amphora_parent_window( window_surface->hwnd );
-        if (!parent)
+        if (parent)
+            win = parent;
+        else if (win)
+            ERR( "amphora surface_flush ioctl-wrapper hwnd=%p (no local parent; cross-process)\n",
+                 window_surface->hwnd );
+        else
         {
-            ERR( "amphora surface_flush no parent hwnd=%p skip (no ioctl/gralloc)\n",
+            ERR( "amphora surface_flush no parent hwnd=%p skip (no ioctl wrapper)\n",
                  window_surface->hwnd );
             return TRUE;
         }
-        win = parent;
     }
 
     ERR( "amphora surface_flush LOCK hwnd=%p win=%p dirty=(%d,%d)-(%d,%d)\n",

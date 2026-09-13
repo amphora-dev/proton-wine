@@ -1733,10 +1733,20 @@ static NTSTATUS queueBuffer_ioctl( void *data, DWORD in_size, DWORD out_size, UL
     if (win_data->mappings[res->buffer_id])
     {
         void *bits;
+        int amphora_mapped = 0;
         ret = gralloc_lock( buffer, &bits );
+        if (ret)
+        {
+            /* Amphora: no gralloc HAL — mmap ANW native_handle like parent LOCK. */
+            ret = amphora_mmap_buffer( buffer, &bits );
+            amphora_mapped = !ret;
+        }
         if (ret) return android_error_to_status( ret );
         memcpy( bits, win_data->mappings[res->buffer_id], buffer->stride * buffer->height * 4 );
-        gralloc_unlock( buffer );
+        if (amphora_mapped)
+            amphora_munmap_buffer( buffer );
+        else
+            gralloc_unlock( buffer );
     }
     wrap_java_call();
     ret = parent->queueBuffer( parent, buffer, -1 );
@@ -2352,7 +2362,11 @@ static int perform( ANativeWindow *window, int operation, ... )
         int ret = window->dequeueBuffer_DEPRECATED( window, &buffer );
         if (!ret)
         {
-            if ((ret = gralloc_lock( buffer, &buffer_ret->bits )))
+            struct native_buffer_wrapper *buf = (struct native_buffer_wrapper *)buffer;
+            /* Amphora / no-gralloc: dequeue already mapped win32 section into buf->bits. */
+            if (buf->bits)
+                buffer_ret->bits = buf->bits;
+            else if ((ret = gralloc_lock( buffer, &buffer_ret->bits )))
             {
                 WARN( "gralloc->lock %p failed %d %s\n", win->hwnd, ret, strerror(-ret) );
                 window->cancelBuffer( window, buffer, -1 );
@@ -2382,7 +2396,9 @@ static int perform( ANativeWindow *window, int operation, ... )
         int ret = -EINVAL;
         if (win->locked_buffer)
         {
-            gralloc_unlock( win->locked_buffer );
+            struct native_buffer_wrapper *buf = (struct native_buffer_wrapper *)win->locked_buffer;
+            if (!buf->bits)
+                gralloc_unlock( win->locked_buffer );
             ret = window->queueBuffer( window, win->locked_buffer, -1 );
             win->locked_buffer = NULL;
         }
