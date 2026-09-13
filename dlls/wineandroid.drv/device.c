@@ -26,10 +26,14 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -729,6 +733,207 @@ static void create_desktop_window( HWND hwnd )
     unwrap_java_call();
 }
 
+/* Amphora host socket (AMPHORA_WINEANDROID=1): replace JNI WineActivity with AF_UNIX. */
+#define AMPHORA_HOST_SURFACE_CHANGED 100
+
+static int amphora_host_fd = -1;
+static int amphora_mode;
+static pthread_t amphora_reader_thread;
+static pthread_mutex_t amphora_send_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int amphora_write_full( int fd, const void *buf, size_t len )
+{
+    const char *p = buf;
+    size_t left = len;
+
+    while (left)
+    {
+        ssize_t n = write( fd, p, left );
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!n) return -1;
+        p += n;
+        left -= n;
+    }
+    return 0;
+}
+
+static int amphora_read_full( int fd, void *buf, size_t len )
+{
+    char *p = buf;
+    size_t left = len;
+
+    while (left)
+    {
+        ssize_t n = read( fd, p, left );
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!n) return -1;
+        p += n;
+        left -= n;
+    }
+    return 0;
+}
+
+static NTSTATUS amphora_send_frame( enum android_ioctl code, const void *payload, DWORD nbytes )
+{
+    int header[2];
+    int fd, ret;
+
+    fd = amphora_host_fd;
+    if (fd < 0) return STATUS_DEVICE_NOT_READY;
+
+    header[0] = code;
+    header[1] = nbytes;
+
+    pthread_mutex_lock( &amphora_send_mutex );
+    ret = amphora_write_full( fd, header, sizeof(header) );
+    if (!ret && nbytes)
+        ret = amphora_write_full( fd, payload, nbytes );
+    pthread_mutex_unlock( &amphora_send_mutex );
+
+    if (ret)
+    {
+        WARN( "amphora send opcode %u nbytes %lu failed err %s\n",
+              code, (unsigned long)nbytes, strerror( errno ));
+        return STATUS_UNSUCCESSFUL;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* CREATE_WINDOW / SET_WINDOW_PARENT: ioctl struct then int32 client pid (WineActivity ABI). */
+static NTSTATUS amphora_send_window_ioctl_with_pid( enum android_ioctl code, const void *payload,
+                                                    DWORD nbytes, DWORD pid )
+{
+    unsigned char buf[256];
+    DWORD total = nbytes + sizeof(pid);
+
+    if (total > sizeof(buf)) return STATUS_BUFFER_OVERFLOW;
+    memcpy( buf, payload, nbytes );
+    memcpy( buf + nbytes, &pid, sizeof(pid) );
+    return amphora_send_frame( code, buf, total );
+}
+
+static void *amphora_host_reader( void *arg )
+{
+    int fd = amphora_host_fd;
+
+    TRACE( "amphora host reader started fd %d\n", fd );
+    for (;;)
+    {
+        int header[2];
+        int hwnd, opengl, ready;
+        unsigned char payload[64];
+        DWORD nbytes;
+
+        if (amphora_read_full( fd, header, sizeof(header) )) break;
+        nbytes = header[1];
+        if (nbytes > sizeof(payload))
+        {
+            WARN( "amphora host opcode %d payload too large %lu\n",
+                  header[0], (unsigned long)nbytes );
+            break;
+        }
+        if (nbytes && amphora_read_full( fd, payload, nbytes )) break;
+
+        if (header[0] == AMPHORA_HOST_SURFACE_CHANGED)
+        {
+            if (nbytes < 12)
+            {
+                WARN( "HOST_SURFACE_CHANGED short payload %lu\n", (unsigned long)nbytes );
+                continue;
+            }
+            memcpy( &hwnd, payload, 4 );
+            memcpy( &opengl, payload + 4, 4 );
+            memcpy( &ready, payload + 8, 4 );
+            /* No ANativeWindow fd this commit — cannot register_native_window yet. */
+            TRACE( "HOST_SURFACE_CHANGED hwnd %08x opengl %d ready %d (no fd; register_native_window TODO)\n",
+                   hwnd, opengl, ready );
+            continue;
+        }
+        WARN( "ignored amphora host opcode %d nbytes %lu\n",
+              header[0], (unsigned long)nbytes );
+    }
+
+    WARN( "amphora host reader exiting\n" );
+    return NULL;
+}
+
+static NTSTATUS amphora_host_connect(void)
+{
+    const char *path;
+    struct sockaddr_un addr;
+    int fd, i, ret;
+
+    path = getenv( "AMPHORA_WINEANDROID_SOCK" );
+    if (!path || !path[0])
+    {
+        ERR( "AMPHORA_WINEANDROID=1 but AMPHORA_WINEANDROID_SOCK unset\n" );
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (strlen( path ) >= sizeof(addr.sun_path))
+    {
+        ERR( "AMPHORA_WINEANDROID_SOCK path too long\n" );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    fd = socket( AF_UNIX, SOCK_STREAM, 0 );
+    if (fd < 0)
+    {
+        ERR( "amphora socket failed: %s\n", strerror( errno ));
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    memset( &addr, 0, sizeof(addr) );
+    addr.sun_family = AF_UNIX;
+    strcpy( addr.sun_path, path );
+
+    /* Host listens before guest start; retry briefly for slow bind. */
+    for (i = 0; i < 50; i++)
+    {
+        ret = connect( fd, (struct sockaddr *)&addr, sizeof(addr) );
+        if (!ret) break;
+        if (errno != ENOENT && errno != ECONNREFUSED)
+        {
+            ERR( "amphora connect(%s) failed: %s\n", path, strerror( errno ));
+            close( fd );
+            return STATUS_UNSUCCESSFUL;
+        }
+        usleep( 100000 ); /* 100ms */
+    }
+    if (ret)
+    {
+        ERR( "amphora connect(%s) timed out: %s\n", path, strerror( errno ));
+        close( fd );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    amphora_host_fd = fd;
+    amphora_mode = 1;
+    if (pthread_create( &amphora_reader_thread, NULL, amphora_host_reader, NULL ))
+        WARN( "amphora reader thread create failed\n" );
+    else
+        pthread_detach( amphora_reader_thread );
+
+    TRACE( "amphora connected to %s fd %d\n", path, fd );
+    return STATUS_SUCCESS;
+}
+
+static void amphora_host_disconnect(void)
+{
+    int fd = amphora_host_fd;
+    if (fd < 0) return;
+    amphora_host_fd = -1;
+    amphora_mode = 0;
+    close( fd );
+}
+
 static NTSTATUS createWindow_ioctl( void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size )
 {
     static jmethodID method;
@@ -743,6 +948,9 @@ static NTSTATUS createWindow_ioctl( void *data, DWORD in_size, DWORD out_size, U
         return STATUS_NO_MEMORY;
 
     TRACE( "hwnd %08x opengl %u parent %08x\n", res->hdr.hwnd, res->hdr.opengl, res->parent );
+
+    if (amphora_mode)
+        return amphora_send_window_ioctl_with_pid( IOCTL_CREATE_WINDOW, res, sizeof(*res), pid );
 
     if (!(object = load_java_method( &method, "createWindow", "(IZIFI)V" ))) return STATUS_NOT_SUPPORTED;
 
@@ -765,6 +973,13 @@ static NTSTATUS destroyWindow_ioctl( void *data, DWORD in_size, DWORD out_size, 
 
     TRACE( "hwnd %08x opengl %u\n", res->hdr.hwnd, res->hdr.opengl );
 
+    if (amphora_mode)
+    {
+        NTSTATUS status = amphora_send_frame( IOCTL_DESTROY_WINDOW, res, sizeof(*res) );
+        if (win_data) free_native_win_data( win_data );
+        return status;
+    }
+
     if (!(object = load_java_method( &method, "destroyWindow", "(I)V" ))) return STATUS_NOT_SUPPORTED;
 
     wrap_java_call();
@@ -785,6 +1000,9 @@ static NTSTATUS windowPosChanged_ioctl( void *data, DWORD in_size, DWORD out_siz
     TRACE( "hwnd %08x win %s client %s visible %s style %08x flags %08x after %08x owner %08x\n",
            res->hdr.hwnd, wine_dbgstr_rect(&res->window_rect), wine_dbgstr_rect(&res->client_rect),
            wine_dbgstr_rect(&res->visible_rect), res->style, res->flags, res->after, res->owner );
+
+    if (amphora_mode)
+        return amphora_send_frame( IOCTL_WINDOW_POS_CHANGED, res, sizeof(*res) );
 
     if (!(object = load_java_method( &method, "windowPosChanged", "(IIIIIIIIIIIIIIIII)V" )))
         return STATUS_NOT_SUPPORTED;
@@ -1041,6 +1259,9 @@ static NTSTATUS setWindowParent_ioctl( void *data, DWORD in_size, DWORD out_size
 
     TRACE( "hwnd %08x parent %08x\n", res->hdr.hwnd, res->parent );
 
+    if (amphora_mode)
+        return amphora_send_window_ioctl_with_pid( IOCTL_SET_WINDOW_PARENT, res, sizeof(*res), pid );
+
     if (!(object = load_java_method( &method, "setParent", "(IIFI)V" ))) return STATUS_NOT_SUPPORTED;
 
     wrap_java_call();
@@ -1153,6 +1374,11 @@ NTSTATUS android_dispatch_ioctl( void *arg )
 NTSTATUS android_java_init( void *arg )
 {
     JavaVM *java_vm;
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+
+    /* Amphora: box64 exec wine - no same-JVM JNI. Connect host AF_UNIX instead. */
+    if (amphora && amphora[0] == '1' && amphora[1] == '\0')
+        return amphora_host_connect();
 
     if (!(java_vm = *p_java_vm)) return STATUS_UNSUCCESSFUL;  /* not running under Java */
 
@@ -1164,6 +1390,12 @@ NTSTATUS android_java_init( void *arg )
 NTSTATUS android_java_uninit( void *arg )
 {
     JavaVM *java_vm;
+
+    if (amphora_mode)
+    {
+        amphora_host_disconnect();
+        return STATUS_SUCCESS;
+    }
 
     if (!(java_vm = *p_java_vm)) return STATUS_UNSUCCESSFUL;  /* not running under Java */
 
