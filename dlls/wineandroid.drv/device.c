@@ -2479,7 +2479,8 @@ static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
     memset( &req, 0, sizeof(req) );
     req.hdr.hwnd = HandleToLong( hwnd );
     req.hdr.opengl = FALSE;
-    status = android_ioctl( IOCTL_FETCH_AMPHORA_PARENT, &req, sizeof(req.hdr), &req, &size );
+    /* METHOD_BUFFERED needs in_size >= out payload so sock_handle is copied back. */
+    status = android_ioctl( IOCTL_FETCH_AMPHORA_PARENT, &req, sizeof(req), &req, &size );
     if (status || size < sizeof(req) || req.sock_handle <= 0)
     {
         WARN( "amphora import parent hwnd=%p status=%lx size=%lu handle=%d\n",
