@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -523,18 +524,10 @@ static HRESULT android_init( void *arg )
     jclass class;
     jobject object;
     JNIEnv *jni_env;
-    JavaVM *java_vm;
+    JavaVM *java_vm = NULL;
     void *ntdll;
-
-    if (!(ntdll = dlopen( "ntdll.so", RTLD_NOW ))) return STATUS_UNSUCCESSFUL;
-
-    p_java_vm = dlsym( ntdll, "java_vm" );
-    p_java_object = dlsym( ntdll, "java_object" );
-    p_java_gdt_sel = dlsym( ntdll, "java_gdt_sel" );
-
-    object = *p_java_object;
-
-    load_hardware_libs();
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+    BOOL amphora_host = amphora && amphora[0] == '1' && amphora[1] == '\0';
 
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
@@ -544,6 +537,40 @@ static HRESULT android_init( void *arg )
 
     register_window_callback = params->register_window_callback;
     start_device_callback = params->start_device_callback;
+
+    /* Amphora: box64 exec wine, no WineActivity JNI. Android's ntdll.so is
+     * aarch64 and sits earlier on LD_LIBRARY_PATH than Wine's x86_64 unix
+     * ntdll, so dlopen("ntdll.so") either fails or yields a module with no
+     * java_vm — both used to abort DllMain before __wine_set_user_driver. */
+    if (amphora_host)
+    {
+        ERR( "amphora host mode, skip JNI/ntdll java_vm\n" );
+        __wine_set_user_driver( &android_drv_funcs, WINE_GDI_DRIVER_VERSION );
+        return STATUS_SUCCESS;
+    }
+
+    ntdll = dlopen( "ntdll.so", RTLD_NOW );
+    if (!ntdll)
+    {
+        ERR( "failed to load ntdll.so: %s, trying RTLD_DEFAULT\n", dlerror() );
+        ntdll = dlopen( NULL, RTLD_NOW );
+    }
+    if (ntdll)
+    {
+        p_java_vm = dlsym( ntdll, "java_vm" );
+        p_java_object = dlsym( ntdll, "java_object" );
+        p_java_gdt_sel = dlsym( ntdll, "java_gdt_sel" );
+    }
+    if (!p_java_vm || !p_java_object)
+    {
+        ERR( "ntdll has no java_vm/java_object; registering driver without JNI\n" );
+        __wine_set_user_driver( &android_drv_funcs, WINE_GDI_DRIVER_VERSION );
+        return STATUS_SUCCESS;
+    }
+
+    object = *p_java_object;
+
+    load_hardware_libs();
 
     if ((java_vm = *p_java_vm))  /* running under Java */
     {
