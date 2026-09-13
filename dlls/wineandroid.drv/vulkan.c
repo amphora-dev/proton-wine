@@ -44,21 +44,11 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
-/* winevulkan's make_vulkan currently skips platform "android", so
- * VK_KHR_android_surface types / has_VK_KHR_android_surface are not generated.
- * Declare the minimal WSI bits locally and resolve the entry point via the
- * host loader (libvulkan.so) until winevulkan exposes the platform. */
-#ifndef VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR
-#define VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR 1000008000
-typedef VkFlags VkAndroidSurfaceCreateFlagsKHR;
-typedef struct VkAndroidSurfaceCreateInfoKHR
-{
-    VkStructureType                  sType;
-    const void                      *pNext;
-    VkAndroidSurfaceCreateFlagsKHR   flags;
-    struct ANativeWindow            *window;
-} VkAndroidSurfaceCreateInfoKHR;
-#endif
+/* wine/vulkan.h (generated for this pin) already provides
+ * VkAndroidSurfaceCreateInfoKHR / VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR.
+ * Do not redeclare them locally: the structure-type token is an enum value, not a
+ * #define, so #ifndef would always succeed and redefine the typedef.
+ * Resolve vkCreateAndroidSurfaceKHR via the host loader (libvulkan.so). */
 
 typedef VkResult (*PFN_android_vkCreateAndroidSurfaceKHR)( VkInstance, const VkAndroidSurfaceCreateInfoKHR *,
                                                            const VkAllocationCallbacks *, VkSurfaceKHR * );
