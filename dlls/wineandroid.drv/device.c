@@ -1469,6 +1469,11 @@ static NTSTATUS createWindow_ioctl( void *data, DWORD in_size, DWORD out_size, U
 
     TRACE( "hwnd %08x opengl %u parent %08x\n", res->hdr.hwnd, res->hdr.opengl, res->parent );
 
+    if (!amphora_mode) {
+        const char *amphora = getenv("AMPHORA_WINEANDROID");
+        if (amphora && amphora[0]=='1' && amphora[1]=='\0')
+            amphora_host_connect();
+    }
     if (amphora_mode)
         return amphora_send_window_ioctl_with_pid( IOCTL_CREATE_WINDOW, res, sizeof(*res), pid );
 
