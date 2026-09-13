@@ -148,10 +148,16 @@ static void CALLBACK register_window_callback( ULONG_PTR arg1, ULONG_PTR arg2, U
 {
     struct register_window_params params = { .arg1 = arg1, .arg2 = arg2, .arg3 = arg3 };
     HWND hwnd = (HWND)arg1;
+    BOOL redrawn;
 
     ERR( "amphora register_window PE-enter hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
     ANDROID_CALL( register_window, &params );
-    /* Post from PE after register (SendMessage deadlocks device_thread↔hwnd thread). */
+    /* REFRESH Post never reaches ANDROID_WindowMessage; dirty hwnd so normal GDI paint
+     * hits android_surface_flush. No RDW_UPDATENOW — that waits like SendMessage. */
+    redrawn = NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+    ERR( "amphora register_window invalidate hwnd=%p opengl=%lu redrawn=%d\n",
+         hwnd, (unsigned long)arg3, redrawn );
+    /* Keep REFRESH Post as a cheap side-channel; not the success path. */
     ERR( "amphora register_window posted-from-PE hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
     NtUserPostMessage( hwnd, WM_ANDROID_REFRESH, arg3, 0 );
 }
