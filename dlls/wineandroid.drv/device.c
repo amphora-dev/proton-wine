@@ -1428,6 +1428,11 @@ static int amphora_parent_get_sock( struct ANativeWindow *win )
     return aw ? aw->sock : -1;
 }
 
+int amphora_native_window_sock( struct ANativeWindow *window )
+{
+    return amphora_parent_get_sock( window );
+}
+
 static struct ANativeWindow *amphora_create_parent( int sock, HWND hwnd, BOOL opengl )
 {
     struct amphora_parent_window *win = calloc( 1, sizeof(*win) );

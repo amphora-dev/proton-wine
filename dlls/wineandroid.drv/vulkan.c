@@ -32,6 +32,10 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -60,6 +64,53 @@ static void *android_vulkan_handle;
 static PFN_android_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
 
 static const struct vulkan_driver_funcs android_vulkan_driver_funcs;
+
+static int amphora_wsi_create_surface( uint64_t vk_instance, int sock, uint64_t *out_surface )
+{
+    char path[128];
+    struct sockaddr_un addr;
+    int fd = -1, i;
+    int32_t sock32 = sock, reply = -EIO;
+    uint64_t surface = 0;
+
+    if (out_surface) *out_surface = 0;
+    snprintf( path, sizeof(path), "/data/user/0/app.amphora/files/wineandroid/wsi-%d.sock",
+              (int)getpid() );
+    ERR( "amphora WSI bridge connect %s inst=0x%s sock=%d\n",
+         path, wine_dbgstr_longlong( vk_instance ), sock );
+
+    for (i = 0; i < 50; i++)
+    {
+        fd = socket( AF_UNIX, SOCK_STREAM, 0 );
+        if (fd < 0) return -errno;
+        memset( &addr, 0, sizeof(addr) );
+        addr.sun_family = AF_UNIX;
+        memcpy( addr.sun_path, path, strlen(path) + 1 );
+        if (!connect( fd, (struct sockaddr *)&addr, sizeof(addr) )) break;
+        close( fd );
+        fd = -1;
+        usleep( 40000 );
+    }
+    if (fd < 0)
+    {
+        ERR( "amphora WSI bridge connect failed %s errno=%d\n", path, errno );
+        return -ENOENT;
+    }
+    if (write( fd, &vk_instance, sizeof(vk_instance) ) != (ssize_t)sizeof(vk_instance) ||
+        write( fd, &sock32, sizeof(sock32) ) != (ssize_t)sizeof(sock32) ||
+        read( fd, &reply, sizeof(reply) ) != (ssize_t)sizeof(reply) ||
+        read( fd, &surface, sizeof(surface) ) != (ssize_t)sizeof(surface) )
+    {
+        ERR( "amphora WSI bridge ipc failed errno=%d\n", errno );
+        close( fd );
+        return -EIO;
+    }
+    close( fd );
+    if (out_surface) *out_surface = surface;
+    ERR( "amphora WSI bridge reply ret=%d surface=0x%s\n", reply, wine_dbgstr_longlong( surface ) );
+    return reply;
+}
+
 
 struct android_vulkan_surface
 {
@@ -153,33 +204,32 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
             ERR( "amphora vulkan hwnd=%p no client ANW after wait\n", hwnd );
     }
 
-    /* Host smoke present proves the dedicated client ANW accepts WSI.
-     * Sock-proxy ANW cannot enter aarch64 vkCreateAndroidSurfaceKHR (Box64),
-     * and pastel headless WSI segfaults on caps — so PE QueuePresent cannot
-     * use host Vulkan WSI yet. After host WSI tears down it leaves the
-     * BufferQueue with no producer (dequeue -19); reconnect CPU API and fill
-     * PE green onto the same Amphora ANW (present ret=0) then SURFACE_LOST.
-     * Not OUT_OF_DATE short-circuit. */
+    /* Sock-proxy ANW is x86_64/Box64 and cannot enter aarch64
+     * vkCreateAndroidSurfaceKHR. The aarch64 helper rebuilds an ANW over the
+     * same Amphora client sock and creates the host Android surface on Wine's
+     * VkInstance so PE QueuePresent DEQUEUE/QUEUEs that dedicated hwnd ANW.
+     * No host-smoke CPU fill and no SURFACE_LOST short-circuit. */
     if (surface->window && surface->amphora_parent)
     {
-        INT32 vkret[4] = { -999, -999, -999, -999 };
-        int pret = amphora_parent_vk_present( surface->window, vkret );
-        unsigned int rgba = 0xff408c0d; /* PE smoke clear ~RGB(13,140,64) */
-        int cret, fret;
+        int sock = amphora_native_window_sock( surface->window );
+        uint64_t host_surface = 0;
+        int wret;
 
-        ERR( "amphora host WSI hwnd=%p own-anw surface=%d swap=%d present=%d sock=%d\n",
-             hwnd, vkret[0], vkret[1], vkret[2], pret );
-        /* Vulkan WSI disconnects producer (api:0); GDI/CPU fill needs API_CPU. */
-        cret = surface->window->perform( surface->window, NATIVE_WINDOW_API_CONNECT,
-                                         NATIVE_WINDOW_API_CPU );
-        surface->window->perform( surface->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT,
-                                  PF_RGBA_8888 );
-        fret = amphora_parent_fill_rgba( surface->window, rgba );
-        ERR( "amphora PE QueuePresent→ANW hwnd=%p fill_rgba=0x%08x connect=%d present ret=%d\n",
-             hwnd, rgba, cret, fret );
-        if (fret == 0) usleep( 2000000 ); /* hold PE fill for screencap */
-        client_surface_release( &surface->client );
-        return fret == 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+        ERR( "amphora PE WSI bridge hwnd=%p anw=%p sock=%d inst=%p\n",
+             hwnd, surface->window, sock, instance->host.instance );
+        wret = amphora_wsi_create_surface( (uint64_t)(UINT_PTR)instance->host.instance,
+                                           sock, &host_surface );
+        ERR( "amphora PE WSI bridge hwnd=%p ret=%d surface=0x%s\n",
+             hwnd, wret, wine_dbgstr_longlong( host_surface ) );
+        if (wret || !host_surface)
+        {
+            client_surface_release( &surface->client );
+            return wret == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR ? VK_ERROR_NATIVE_WINDOW_IN_USE_KHR
+                 : VK_ERROR_SURFACE_LOST_KHR;
+        }
+        *handle = (VkSurfaceKHR)(UINT_PTR)host_surface;
+        *client = &surface->client;
+        return VK_SUCCESS;
     }
 
     if (!surface->window)
