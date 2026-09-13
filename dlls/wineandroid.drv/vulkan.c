@@ -63,6 +63,7 @@ struct android_vulkan_surface
 {
     struct client_surface client;
     struct ANativeWindow *window;
+    BOOL amphora_parent; /* release via ANW incRef/decRef, not ioctl wrapper */
 };
 
 static struct android_vulkan_surface *impl_from_client_surface( struct client_surface *client )
@@ -75,7 +76,11 @@ static void android_vulkan_client_surface_destroy( struct client_surface *client
     struct android_vulkan_surface *surface = impl_from_client_surface( client );
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
-    if (surface->window) release_ioctl_window( surface->window );
+    if (!surface->window) return;
+    if (surface->amphora_parent)
+        surface->window->common.decRef( &surface->window->common );
+    else
+        release_ioctl_window( surface->window );
 }
 
 static void android_vulkan_client_surface_detach( struct client_surface *client )
@@ -109,6 +114,8 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
     PFN_android_vkCreateAndroidSurfaceKHR p_vkCreateAndroidSurfaceKHR;
     VkResult res;
 
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+
     TRACE( "%p %u %p %p %p\n", hwnd, raw, instance, handle, client );
     (void)raw;
 
@@ -116,11 +123,32 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
                                                                              &android_vulkan_client_surface_funcs, hwnd )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (!(surface->window = get_client_window( hwnd )))
+    /* Amphora GDI posts via get_amphora_parent_window (sock proxy to host ANW).
+     * Attach VkSurfaceKHR to that same proxy so WSI dequeue/queue hits the
+     * identical SurfaceView buffer path — do not open a parallel ioctl client. */
+    if (amphora && amphora[0] == '1' && amphora[1] == '\0')
     {
-        ERR( "Failed to get ANativeWindow for hwnd %p\n", hwnd );
-        client_surface_release( &surface->client );
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+        surface->window = get_amphora_parent_window( hwnd );
+        if (surface->window)
+        {
+            surface->window->common.incRef( &surface->window->common );
+            surface->amphora_parent = TRUE;
+            ERR( "amphora vulkan surface hwnd=%p anw=%p (parent/GDI path)\n", hwnd, surface->window );
+        }
+        else
+            ERR( "amphora vulkan surface hwnd=%p no parent ANW yet\n", hwnd );
+    }
+
+    if (!surface->window)
+    {
+        if (!(surface->window = get_client_window( hwnd )))
+        {
+            ERR( "Failed to get ANativeWindow for hwnd %p\n", hwnd );
+            client_surface_release( &surface->client );
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        surface->amphora_parent = FALSE;
+        ERR( "vulkan surface hwnd=%p anw=%p (ioctl client)\n", hwnd, surface->window );
     }
 
     if (!p_vkGetInstanceProcAddr)
@@ -151,6 +179,8 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
     }
 
     *client = &surface->client;
+    ERR( "amphora vkCreateAndroidSurfaceKHR hwnd=%p anw=%p surface=0x%s res=0\n",
+         hwnd, surface->window, wine_dbgstr_longlong( *handle ) );
     TRACE( "Created surface 0x%s, client %s\n", wine_dbgstr_longlong( *handle ),
            debugstr_client_surface( *client ) );
     return VK_SUCCESS;
@@ -223,6 +253,7 @@ UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_
     if (!p_vkGetInstanceProcAddr)
         WARN( "vkGetInstanceProcAddr not found in vulkan library\n" );
 
+    ERR( "ANDROID_VulkanInit ok handle=%p gipa=%p\n", android_vulkan_handle, p_vkGetInstanceProcAddr );
     TRACE( "using vulkan handle %p\n", android_vulkan_handle );
     *driver_funcs = &android_vulkan_driver_funcs;
     return STATUS_SUCCESS;
