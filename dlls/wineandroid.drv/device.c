@@ -1936,7 +1936,7 @@ void start_android_device(void)
 
 static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size )
 {
-    static const WCHAR deviceW[] = {'\\','\\','.','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
+    static const WCHAR deviceW[] = {'\\','?','?','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
     static HANDLE device;
     IO_STATUS_BLOCK iosb;
     NTSTATUS status;
@@ -1975,6 +1975,7 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
                 return -ENOENT;
             }
         }
+        ERR( "amphora android_ioctl NtCreateFile WineAndroid ok handle=%p\n", file );
         if (InterlockedCompareExchangePointer( &device, file, NULL )) NtClose( file );
     }
 
