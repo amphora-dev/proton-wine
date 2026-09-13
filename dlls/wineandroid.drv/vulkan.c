@@ -33,6 +33,9 @@
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
+#include "windef.h"
+#include "winbase.h"
+
 #include "android.h"
 #include "wine/debug.h"
 
@@ -69,7 +72,7 @@ static const struct vulkan_driver_funcs android_vulkan_driver_funcs;
 struct android_vulkan_surface
 {
     struct client_surface client;
-    ANativeWindow *window;
+    struct ANativeWindow *window;
 };
 
 static struct android_vulkan_surface *impl_from_client_surface( struct client_surface *client )
@@ -119,7 +122,8 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
     TRACE( "%p %u %p %p %p\n", hwnd, raw, instance, handle, client );
     (void)raw;
 
-    if (!(surface = client_surface_create( sizeof(*surface), &android_vulkan_client_surface_funcs, hwnd )))
+    if (!(surface = (struct android_vulkan_surface *)client_surface_create( sizeof(*surface),
+                                                                             &android_vulkan_client_surface_funcs, hwnd )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
 
     if (!(surface->window = get_client_window( hwnd )))
