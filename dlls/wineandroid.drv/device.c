@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pthread.h>
@@ -592,7 +593,8 @@ NTSTATUS android_register_window( void *arg )
             lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
             ERR( "amphora register_window ANW LOCK hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
                  hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
-            if (!lock_ret && buffer.bits && buffer.width > 0 && buffer.height > 0 && buffer.stride > 0)
+            if (!lock_ret && buffer.bits && (uintptr_t)buffer.bits >= 0x1000 &&
+                buffer.width > 0 && buffer.height > 0 && buffer.stride > 0)
             {
                 bits = buffer.bits;
                 max_w = buffer.width;
@@ -834,6 +836,8 @@ struct amphora_parent_window
         int buffer_id;
         int generation;
         LONG ref;
+        void *map_bits;
+        size_t map_size;
     } *bufs[NB_CACHED_BUFFERS];
 };
 
@@ -979,8 +983,60 @@ static void amphora_buf_dec( struct android_native_base_t *base )
 {
     struct amphora_buf *buf = (struct amphora_buf *)base;
     if (InterlockedDecrement( &buf->ref ) > 0) return;
+    if (buf->map_bits)
+    {
+        munmap( buf->map_bits, buf->map_size );
+        buf->map_bits = NULL;
+        buf->map_size = 0;
+    }
     if (buf->handle) close_native_handle( buf->handle );
     free( buf );
+}
+
+/* Amphora has no gralloc HAL; mmap native_handle fd for CPU access. */
+static int amphora_mmap_buffer( struct ANativeWindowBuffer *buffer, void **bits )
+{
+    struct amphora_buf *buf = (struct amphora_buf *)buffer;
+    native_handle_t *nh = buf->handle;
+    size_t size;
+    void *p;
+    int i, fd = -1;
+
+    if (buf->map_bits)
+    {
+        *bits = buf->map_bits;
+        return 0;
+    }
+    if (!nh || nh->numFds < 1) return -EINVAL;
+    size = (size_t)buffer->stride * (size_t)buffer->height * 4;
+    if (!size) return -EINVAL;
+    /* Prefer a mmap-able fd; try each handle fd. */
+    for (i = 0; i < nh->numFds; i++)
+    {
+        p = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, nh->data[i], 0 );
+        if (p != MAP_FAILED)
+        {
+            fd = nh->data[i];
+            buf->map_bits = p;
+            buf->map_size = size;
+            *bits = p;
+            TRACE( "amphora mmap buffer id=%d fd=%d size=%zu -> %p\n",
+                   buf->buffer_id, fd, size, p );
+            return 0;
+        }
+    }
+    ERR( "amphora mmap buffer id=%d numFds=%d size=%zu failed errno=%d\n",
+         buf->buffer_id, nh->numFds, size, errno );
+    return -errno;
+}
+
+static void amphora_munmap_buffer( struct ANativeWindowBuffer *buffer )
+{
+    struct amphora_buf *buf = (struct amphora_buf *)buffer;
+    if (!buf->map_bits) return;
+    munmap( buf->map_bits, buf->map_size );
+    buf->map_bits = NULL;
+    buf->map_size = 0;
 }
 
 static void amphora_parent_inc( struct android_native_base_t *base )
@@ -1253,7 +1309,7 @@ static int amphora_parent_perform( struct ANativeWindow *window, int operation, 
         break;
     case NATIVE_WINDOW_LOCK:
     {
-        /* Match ioctl wrapper: dequeue + gralloc_lock locally. */
+        /* Dequeue + CPU map locally (gralloc HAL or mmap native_handle). */
         struct ANativeWindow_Buffer *buffer_ret = va_arg( ap, ANativeWindow_Buffer * );
         ARect *bounds = va_arg( ap, ARect * );
         struct ANativeWindowBuffer *buffer;
@@ -1261,22 +1317,28 @@ static int amphora_parent_perform( struct ANativeWindow *window, int operation, 
         va_end( ap );
         if (!r)
         {
-            if ((r = gralloc_lock( buffer, &buffer_ret->bits )))
-                amphora_parent_cancel( window, buffer, -1 );
-            else
+            buffer_ret->bits = NULL;
+            if (gralloc1_device || gralloc_module)
+                r = gralloc_lock( buffer, &buffer_ret->bits );
+            if (r || !buffer_ret->bits || (uintptr_t)buffer_ret->bits < 0x1000)
+                r = amphora_mmap_buffer( buffer, &buffer_ret->bits );
+            if (r || !buffer_ret->bits || (uintptr_t)buffer_ret->bits < 0x1000)
             {
-                buffer_ret->width = buffer->width;
-                buffer_ret->height = buffer->height;
-                buffer_ret->stride = buffer->stride;
-                buffer_ret->format = buffer->format;
-                win->locked = buffer;
-                if (bounds)
-                {
-                    bounds->left = 0;
-                    bounds->top = 0;
-                    bounds->right = buffer->width;
-                    bounds->bottom = buffer->height;
-                }
+                ERR( "amphora parent LOCK map failed r=%d bits=%p\n", r, buffer_ret->bits );
+                amphora_parent_cancel( window, buffer, -1 );
+                return r ? r : -EFAULT;
+            }
+            buffer_ret->width = buffer->width;
+            buffer_ret->height = buffer->height;
+            buffer_ret->stride = buffer->stride;
+            buffer_ret->format = buffer->format;
+            win->locked = buffer;
+            if (bounds)
+            {
+                bounds->left = 0;
+                bounds->top = 0;
+                bounds->right = buffer->width;
+                bounds->bottom = buffer->height;
             }
         }
         return r;
@@ -1290,7 +1352,10 @@ static int amphora_parent_perform( struct ANativeWindow *window, int operation, 
     if (operation == NATIVE_WINDOW_UNLOCK_AND_POST)
     {
         if (!win->locked) return -EINVAL;
-        gralloc_unlock( win->locked );
+        if (gralloc1_device || gralloc_module)
+            gralloc_unlock( win->locked );
+        else
+            amphora_munmap_buffer( win->locked );
         ret = amphora_parent_queue( window, win->locked, -1 );
         win->locked = NULL;
         return ret;
