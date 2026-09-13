@@ -1051,6 +1051,9 @@ BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_r
 {
     struct window_surface *previous;
     struct android_win_data *data;
+    static int expose_in_progress;
+    const char *amphora;
+    BOOL exposed;
 
     TRACE( "hwnd %p, layered %u, surface_rect %s, surface %p\n", hwnd, layered, wine_dbgstr_rect( surface_rect ), surface );
 
@@ -1061,6 +1064,20 @@ BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_r
     *surface = create_surface( data->hwnd, surface_rect );
 
     release_win_data( data );
+
+    /* Amphora: Invalidate-after-bind can race a recreating CreateWindowSurface that
+     * wipes dirty; Expose the new surface without size-changing Redraw/Invalidate. */
+    amphora = getenv( "AMPHORA_WINEANDROID" );
+    if (amphora && amphora[0] == '1' && amphora[1] == '\0' && !expose_in_progress)
+    {
+        expose_in_progress = 1;
+        ERR( "amphora CreateWindowSurface expose hwnd=%p rect=%s\n",
+             hwnd, wine_dbgstr_rect( surface_rect ) );
+        exposed = NtUserExposeWindowSurface( hwnd, 0, surface_rect, 0 );
+        if (!exposed)
+            ERR( "amphora CreateWindowSurface ExposeWindowSurface failed hwnd=%p\n", hwnd );
+        expose_in_progress = 0;
+    }
     return TRUE;
 }
 
