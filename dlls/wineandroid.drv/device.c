@@ -1984,9 +1984,9 @@ static NTSTATUS fetchAmphoraParent_ioctl( void *data, DWORD in_size, DWORD out_s
     HANDLE process = 0;
     int handle;
 
-    ERR( "amphora fetch parent enter hwnd=%08x in=%lu out=%lu client=%08x\n",
-         res->hdr.hwnd, (unsigned long)in_size, (unsigned long)out_size,
-         (unsigned)current_client_id() );
+    TRACE( "amphora fetch parent enter hwnd=%08x in=%lu out=%lu client=%08x\n",
+           res->hdr.hwnd, (unsigned long)in_size, (unsigned long)out_size,
+           (unsigned)current_client_id() );
     if (in_size < sizeof(res->hdr) || out_size < sizeof(*res))
     {
         ERR( "amphora fetch parent BUFFER_OVERFLOW in=%lu out=%lu need_out=%zu\n",
@@ -2000,8 +2000,8 @@ static NTSTATUS fetchAmphoraParent_ioctl( void *data, DWORD in_size, DWORD out_s
     }
     if (win_data->amphora_sock < 0 || !win_data->parent)
     {
-        ERR( "amphora fetch parent NOT_READY hwnd=%08x sock=%d parent=%p\n",
-             res->hdr.hwnd, win_data->amphora_sock, win_data->parent );
+        WARN( "amphora fetch parent NOT_READY hwnd=%08x sock=%d parent=%p\n",
+              res->hdr.hwnd, win_data->amphora_sock, win_data->parent );
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2028,7 +2028,7 @@ static NTSTATUS fetchAmphoraParent_ioctl( void *data, DWORD in_size, DWORD out_s
     }
     res->sock_handle = handle;
     *ret_size = sizeof(*res);
-    ERR( "amphora fetch parent hwnd=%08x sock_handle=%d\n", res->hdr.hwnd, handle );
+    TRACE( "amphora fetch parent hwnd=%08x sock_handle=%d\n", res->hdr.hwnd, handle );
     return STATUS_SUCCESS;
 }
 
@@ -2538,7 +2538,7 @@ static struct ANativeWindow *amphora_import_parent_from_device( HWND hwnd )
     /* Match device-side register: CPU API + RGBA format. */
     if (data->api) parent->perform( parent, NATIVE_WINDOW_API_CONNECT, data->api );
     parent->perform( parent, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
-    ERR( "amphora import parent bound hwnd=%p parent=%p sock=%d\n", hwnd, parent, fd );
+    TRACE( "amphora import parent bound hwnd=%p parent=%p sock=%d\n", hwnd, parent, fd );
     return parent;
 }
 

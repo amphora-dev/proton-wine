@@ -620,20 +620,20 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
         ANativeWindow *parent = get_amphora_parent_window( window_surface->hwnd );
         if (!parent)
         {
-            ERR( "amphora surface_flush no parent hwnd=%p skip (no ioctl/gralloc)\n",
-                 window_surface->hwnd );
+            WARN( "amphora surface_flush no parent hwnd=%p skip (no ioctl/gralloc)\n",
+                  window_surface->hwnd );
             return TRUE;
         }
         win = parent;
     }
 
-    ERR( "amphora surface_flush LOCK hwnd=%p win=%p dirty=(%d,%d)-(%d,%d)\n",
-         window_surface->hwnd, win, dirty->left, dirty->top, dirty->right, dirty->bottom );
+    TRACE( "amphora surface_flush LOCK hwnd=%p win=%p dirty=(%d,%d)-(%d,%d)\n",
+           window_surface->hwnd, win, dirty->left, dirty->top, dirty->right, dirty->bottom );
 
     memset( &buffer, 0, sizeof(buffer) );
     lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
-    ERR( "amphora surface_flush LOCK result hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
-         window_surface->hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
+    TRACE( "amphora surface_flush LOCK result hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
+           window_surface->hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
 
     if (!lock_ret && buffer.bits && (uintptr_t)buffer.bits >= 0x1000)
     {
@@ -693,7 +693,7 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
             dst += buffer.stride;
         }
         win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
-        ERR( "amphora surface_flush UNLOCK_AND_POST hwnd=%p win=%p\n", window_surface->hwnd, win );
+        TRACE( "amphora surface_flush UNLOCK_AND_POST hwnd=%p win=%p\n", window_surface->hwnd, win );
     }
     else
     {
