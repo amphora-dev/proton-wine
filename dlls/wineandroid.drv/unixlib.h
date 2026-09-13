@@ -26,6 +26,7 @@ enum android_funcs
     unix_java_init,
     unix_java_uninit,
     unix_register_window,
+    unix_host_reader,
     unix_funcs_count
 };
 

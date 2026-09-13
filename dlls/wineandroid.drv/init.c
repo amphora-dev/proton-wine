@@ -600,6 +600,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     android_java_init,
     android_java_uninit,
     android_register_window,
+    android_host_reader,
 };
 
 

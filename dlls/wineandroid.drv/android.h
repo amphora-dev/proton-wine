@@ -110,6 +110,7 @@ extern BOOL has_client_surface( HWND hwnd );
 /* unixlib interface */
 
 extern NTSTATUS android_dispatch_ioctl( void *arg );
+extern NTSTATUS android_host_reader( void *arg );
 extern NTSTATUS android_java_init( void *arg );
 extern NTSTATUS android_java_uninit( void *arg );
 extern NTSTATUS android_register_window( void *arg );

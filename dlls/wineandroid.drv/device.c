@@ -748,7 +748,6 @@ static void create_desktop_window( HWND hwnd )
 
 static int amphora_host_fd = -1;
 static int amphora_mode;
-static pthread_t amphora_reader_thread;
 static pthread_mutex_t amphora_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct amphora_parent_window
@@ -1282,11 +1281,11 @@ static void amphora_apply_desktop( int width, int height )
     TRACE( "HOST_DESKTOP_CHANGED %ux%u\n", width, height );
 }
 
-static void *amphora_host_reader( void *arg )
+NTSTATUS android_host_reader( void *arg )
 {
     int fd = amphora_host_fd;
 
-    TRACE( "amphora host reader started fd %d\n", fd );
+    ERR( "amphora host reader started fd %d\n", fd );
     for (;;)
     {
         int header[2];
@@ -1378,7 +1377,7 @@ static void *amphora_host_reader( void *arg )
     }
 
     WARN( "amphora host reader exiting\n" );
-    return NULL;
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS amphora_host_connect(void)
@@ -1432,10 +1431,6 @@ static NTSTATUS amphora_host_connect(void)
 
     amphora_host_fd = fd;
     amphora_mode = 1;
-    if (pthread_create( &amphora_reader_thread, NULL, amphora_host_reader, NULL ))
-        WARN( "amphora reader thread create failed\n" );
-    else
-        pthread_detach( amphora_reader_thread );
 
     TRACE( "amphora connected to %s fd %d\n", path, fd );
     return STATUS_SUCCESS;

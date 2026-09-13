@@ -62,6 +62,12 @@ static NTSTATUS CALLBACK init_android_driver( DRIVER_OBJECT *driver, UNICODE_STR
     return IoCreateSymbolicLink( &linkW, &nameW );
 }
 
+static DWORD CALLBACK amphora_host_reader_thread( void *arg )
+{
+    ANDROID_CALL( host_reader, NULL );
+    return 0;
+}
+
 static DWORD CALLBACK device_thread( void *arg )
 {
     static const WCHAR driver_nameW[] = {'\\','D','r','i','v','e','r','\\','W','i','n','e','A','n','d','r','o','i','d',0 };
@@ -76,6 +82,12 @@ static DWORD CALLBACK device_thread( void *arg )
     status = ANDROID_CALL( java_init, NULL );
     ERR( "amphora device_thread java_init status=%lx\n", status );
     if (status) return 0;  /* not running under Java */
+
+    {
+        HANDLE reader = CreateThread( NULL, 0, amphora_host_reader_thread, NULL, 0, NULL );
+        if (reader) CloseHandle( reader );
+        else ERR( "amphora host reader CreateThread failed\n" );
+    }
 
     RtlInitUnicodeString( &nameW, driver_nameW );
     if ((status = IoCreateDriver( &nameW, init_android_driver )))
