@@ -201,6 +201,12 @@ struct swapchain
     VkDescriptorSetLayout descriptor_set_layout;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
+
+    /* Amphora PE software swapchain (pastel headless WSI is broken). */
+    BOOL amphora_sw;
+    uint32_t amphora_next;
+    VkImage amphora_images[4];
+    VkDeviceMemory amphora_memory;
 };
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
@@ -1766,6 +1772,37 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
     return TRUE;
 }
 
+
+static BOOL amphora_wineandroid(void)
+{
+    const char *e = getenv( "AMPHORA_WINEANDROID" );
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+static void amphora_synth_surface_capabilities( struct surface *surface, VkSurfaceCapabilitiesKHR *capabilities )
+{
+    RECT client_rect = {0};
+    uint32_t w = 640, h = 480;
+
+    memset( capabilities, 0, sizeof(*capabilities) );
+    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
+    {
+        w = max( 1, (uint32_t)(client_rect.right - client_rect.left) );
+        h = max( 1, (uint32_t)(client_rect.bottom - client_rect.top) );
+    }
+    capabilities->minImageCount = 2;
+    capabilities->maxImageCount = 4;
+    capabilities->currentExtent.width = w;
+    capabilities->currentExtent.height = h;
+    capabilities->minImageExtent = capabilities->currentExtent;
+    capabilities->maxImageExtent = capabilities->currentExtent;
+    capabilities->maxImageArrayLayers = 1;
+    capabilities->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    capabilities->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    capabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    capabilities->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+}
+
 static void adjust_surface_capabilities( struct vulkan_instance *instance, struct surface *surface,
                                          VkSurfaceCapabilitiesKHR *capabilities )
 {
@@ -1800,6 +1837,12 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevi
     VkResult res;
 
     if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
+    /* Pastel/SwiftShader segfaults on headless surface caps; Amphora PE uses headless. */
+    if (amphora_wineandroid())
+    {
+        amphora_synth_surface_capabilities( surface, capabilities );
+        return VK_SUCCESS;
+    }
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
                                                        surface->obj.host.surface, capabilities );
     if (!res) adjust_surface_capabilities( instance, surface, capabilities );
@@ -2551,6 +2594,103 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     if (surface) create_info_host.surface = surface->obj.host.surface;
     if (old_swapchain) create_info_host.oldSwapchain = old_swapchain->obj.host.swapchain;
 
+    if (amphora_wineandroid())
+    {
+        VkMemoryRequirements mem_req;
+        VkMemoryAllocateInfo alloc_info;
+        VkPhysicalDeviceMemoryProperties mem_props;
+        VkImageCreateInfo image_info;
+        uint32_t i, mem_type = 0;
+        VkDeviceSize mem_total = 0, align = 1;
+
+        amphora_synth_surface_capabilities( surface, &capabilities );
+        create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
+        create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
+
+        if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        swapchain->amphora_sw = TRUE;
+        swapchain->n_images = 3;
+        swapchain->surface = surface;
+        swapchain->extents = create_info_host.imageExtent;
+
+        memset( &image_info, 0, sizeof(image_info) );
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = create_info->imageFormat;
+        image_info.extent.width = create_info_host.imageExtent.width;
+        image_info.extent.height = create_info_host.imageExtent.height;
+        image_info.extent.depth = 1;
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = create_info->imageUsage ? create_info->imageUsage
+            : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        for (i = 0; i < swapchain->n_images; i++)
+        {
+            if ((res = device->p_vkCreateImage( device->host.device, &image_info, NULL, &swapchain->amphora_images[i] )))
+            {
+                while (i--) device->p_vkDestroyImage( device->host.device, swapchain->amphora_images[i], NULL );
+                free( swapchain );
+                return res;
+            }
+            device->p_vkGetImageMemoryRequirements( device->host.device, swapchain->amphora_images[i], &mem_req );
+            if (mem_req.alignment > align) align = mem_req.alignment;
+            mem_total = (mem_total + align - 1) / align * align;
+            mem_total += mem_req.size;
+        }
+        mem_props = physical_device->memory_properties;
+        device->p_vkGetImageMemoryRequirements( device->host.device, swapchain->amphora_images[0], &mem_req );
+        for (mem_type = 0; mem_type < mem_props.memoryTypeCount; mem_type++)
+        {
+            if ((mem_req.memoryTypeBits & (1u << mem_type)) &&
+                (mem_props.memoryTypes[mem_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                break;
+        }
+        if (mem_type >= mem_props.memoryTypeCount)
+        {
+            for (mem_type = 0; mem_type < mem_props.memoryTypeCount; mem_type++)
+                if (mem_req.memoryTypeBits & (1u << mem_type)) break;
+            if (mem_type >= mem_props.memoryTypeCount) mem_type = 0;
+        }
+        memset( &alloc_info, 0, sizeof(alloc_info) );
+        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc_info.allocationSize = mem_total ? mem_total : mem_req.size * swapchain->n_images;
+        alloc_info.memoryTypeIndex = mem_type;
+        if ((res = device->p_vkAllocateMemory( device->host.device, &alloc_info, NULL, &swapchain->amphora_memory )))
+        {
+            for (i = 0; i < swapchain->n_images; i++) device->p_vkDestroyImage( device->host.device, swapchain->amphora_images[i], NULL );
+            free( swapchain );
+            return res;
+        }
+        mem_total = 0;
+        for (i = 0; i < swapchain->n_images; i++)
+        {
+            device->p_vkGetImageMemoryRequirements( device->host.device, swapchain->amphora_images[i], &mem_req );
+            mem_total = (mem_total + mem_req.alignment - 1) / mem_req.alignment * mem_req.alignment;
+            if ((res = device->p_vkBindImageMemory( device->host.device, swapchain->amphora_images[i],
+                                                    swapchain->amphora_memory, mem_total )))
+            {
+                device->p_vkFreeMemory( device->host.device, swapchain->amphora_memory, NULL );
+                for (i = 0; i < swapchain->n_images; i++)
+                    device->p_vkDestroyImage( device->host.device, swapchain->amphora_images[i], NULL );
+                free( swapchain );
+                return res;
+            }
+            mem_total += mem_req.size;
+        }
+        /* No host swapchain: present is client_surface_present → Amphora ANW fill. */
+        vulkan_object_init( &swapchain->obj.obj, (UINT64)(UINT_PTR)swapchain );
+        instance->p_insert_object( instance, &swapchain->obj.obj );
+        *ret = swapchain->obj.client.swapchain;
+        ERR( "amphora PE software swapchain hwnd=%p %ux%u images=%u\n",
+             surface->hwnd, swapchain->extents.width, swapchain->extents.height, swapchain->n_images );
+        return VK_SUCCESS;
+    }
+
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
     if (res) return res;
@@ -2645,6 +2785,18 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 
+    if (swapchain->amphora_sw)
+    {
+        for (uint32_t i = 0; i < swapchain->n_images; ++i)
+            if (swapchain->amphora_images[i])
+                device->p_vkDestroyImage( device->host.device, swapchain->amphora_images[i], NULL );
+        if (swapchain->amphora_memory)
+            device->p_vkFreeMemory( device->host.device, swapchain->amphora_memory, NULL );
+        instance->p_remove_object( instance, &swapchain->obj.obj );
+        free( swapchain );
+        return;
+    }
+
     if (swapchain->fshack_dpi)
     {
         for (uint32_t i = 0; i < swapchain->n_images; ++i)
@@ -2718,6 +2870,16 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+    if (swapchain->amphora_sw)
+    {
+        *image_index = swapchain->amphora_next % swapchain->n_images;
+        swapchain->amphora_next++;
+        (void)semaphore;
+        (void)fence;
+        (void)timeout;
+        return VK_SUCCESS;
+    }
+
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
@@ -2745,6 +2907,18 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
     uint32_t i;
+
+    if (swapchain->amphora_sw)
+    {
+        if (!images)
+        {
+            *count = swapchain->n_images;
+            return VK_SUCCESS;
+        }
+        if (*count > swapchain->n_images) *count = swapchain->n_images;
+        for (i = 0; i < *count; ++i) images[i] = swapchain->amphora_images[i];
+        return *count == swapchain->n_images ? VK_SUCCESS : VK_INCOMPLETE;
+    }
 
     if (images && swapchain->fshack_dpi)
     {
@@ -2998,7 +3172,15 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     pthread_mutex_lock( &lock );
-    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    if (present_info->swapchainCount == 1 &&
+        swapchain_from_handle( client_swapchains[0] )->amphora_sw)
+    {
+        res = VK_SUCCESS;
+        if (present_info->pResults) present_info->pResults[0] = VK_SUCCESS;
+        ERR( "amphora PE vkQueuePresentKHR software ret=0\n" );
+    }
+    else
+        res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
     pthread_mutex_unlock( &lock );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
