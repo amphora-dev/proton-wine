@@ -1255,7 +1255,7 @@ BOOL ANDROID_CreateDesktop( const WCHAR *name, UINT width, UINT height )
             init_monitors( width, height );
             ERR( "amphora CreateDesktop %ux%u, skip Java surface wait\n", width, height );
         }
-        return 0;
+        return TRUE;
     }
 
     /* wait until we receive the surface changed event */
