@@ -149,6 +149,7 @@ static void CALLBACK register_window_callback( ULONG_PTR arg1, ULONG_PTR arg2, U
     struct register_window_params params = { .arg1 = arg1, .arg2 = arg2, .arg3 = arg3 };
     HWND hwnd = (HWND)arg1;
 
+    ERR( "amphora register_window PE-enter hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
     ANDROID_CALL( register_window, &params );
     /* Unix NtUserPostMessage from ANDROID_CALL did not reach ANDROID_WindowMessage;
      * post from PE after the register call so the driver hook can flush GDI. */

@@ -260,8 +260,14 @@ static inline BOOL is_client_in_process(void)
 #ifdef __i386__  /* the Java VM uses %fs/%gs for its own purposes, so we need to wrap the calls */
 
 static WORD orig_fs, java_fs;
-static inline void wrap_java_call(void)   { __asm__( "mov %0,%%fs" :: "r" (java_fs) ); }
-static inline void unwrap_java_call(void) { __asm__( "mov %0,%%fs" :: "r" (orig_fs) ); }
+static inline void wrap_java_call(void)
+{
+    if (java_fs) __asm__( "mov %0,%%fs" :: "r" (java_fs) );
+}
+static inline void unwrap_java_call(void)
+{
+    if (orig_fs) __asm__( "mov %0,%%fs" :: "r" (orig_fs) );
+}
 static inline void init_java_thread( JavaVM *java_vm )
 {
     java_fs = *p_java_gdt_sel;
@@ -278,8 +284,15 @@ static inline void init_java_thread( JavaVM *java_vm )
 #include <asm/unistd.h>
 static void *orig_teb, *java_teb;
 static inline int arch_prctl( int func, void *ptr ) { return syscall( __NR_arch_prctl, func, ptr ); }
-static inline void wrap_java_call(void)   { arch_prctl( ARCH_SET_GS, java_teb ); }
-static inline void unwrap_java_call(void) { arch_prctl( ARCH_SET_GS, orig_teb ); }
+static inline void wrap_java_call(void)
+{
+    /* Amphora skips init_java_thread; null GS would kill TEB and prevent PE return. */
+    if (java_teb) arch_prctl( ARCH_SET_GS, java_teb );
+}
+static inline void unwrap_java_call(void)
+{
+    if (orig_teb) arch_prctl( ARCH_SET_GS, orig_teb );
+}
 static inline void init_java_thread( JavaVM *java_vm )
 {
     arch_prctl( ARCH_GET_GS, &orig_teb );
