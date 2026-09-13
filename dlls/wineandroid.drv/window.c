@@ -603,17 +603,38 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
 {
     struct android_window_surface *surface = get_android_surface( window_surface );
     ANativeWindow_Buffer buffer;
+    ANativeWindow *win = surface->window;
     ARect rc;
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+    int lock_ret;
 
     rc.left   = dirty->left;
     rc.top    = dirty->top;
     rc.right  = dirty->right;
     rc.bottom = dirty->bottom;
 
-    ERR( "amphora surface_flush LOCK hwnd=%p dirty=(%d,%d)-(%d,%d)\n",
-         window_surface->hwnd, dirty->left, dirty->top, dirty->right, dirty->bottom );
+    /* Amphora: LOCK parent mmap ANW (same path as former probe), not ioctl/gralloc wrapper. */
+    if (amphora && amphora[0] == '1')
+    {
+        ANativeWindow *parent = get_amphora_parent_window( window_surface->hwnd );
+        if (!parent)
+        {
+            ERR( "amphora surface_flush no parent hwnd=%p skip (no ioctl/gralloc)\n",
+                 window_surface->hwnd );
+            return TRUE;
+        }
+        win = parent;
+    }
 
-    if (!surface->window->perform( surface->window, NATIVE_WINDOW_LOCK, &buffer, &rc ))
+    ERR( "amphora surface_flush LOCK hwnd=%p win=%p dirty=(%d,%d)-(%d,%d)\n",
+         window_surface->hwnd, win, dirty->left, dirty->top, dirty->right, dirty->bottom );
+
+    memset( &buffer, 0, sizeof(buffer) );
+    lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
+    ERR( "amphora surface_flush LOCK result hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
+         window_surface->hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
+
+    if (!lock_ret && buffer.bits && (uintptr_t)buffer.bits >= 0x1000)
     {
         const RECT *rgn_rect = surface->clip_rects, *end = surface->clip_rects + surface->clip_count;
         UINT alpha_mask = window_surface->alpha_mask, alpha_bits = window_surface->alpha_bits;
@@ -659,11 +680,15 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
             src += color_info->bmiHeader.biWidth;
             dst += buffer.stride;
         }
-        surface->window->perform( surface->window, NATIVE_WINDOW_UNLOCK_AND_POST );
-        ERR( "amphora surface_flush UNLOCK_AND_POST hwnd=%p\n", window_surface->hwnd );
+        win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
+        ERR( "amphora surface_flush UNLOCK_AND_POST hwnd=%p win=%p\n", window_surface->hwnd, win );
     }
-    else ERR( "amphora Unable to lock surface %p window %p buffer %p\n",
-              surface, window_surface->hwnd, surface->window );
+    else
+    {
+        if (!lock_ret) win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
+        ERR( "amphora Unable to lock surface %p hwnd=%p win=%p lock=%d bits=%p\n",
+              surface, window_surface->hwnd, win, lock_ret, buffer.bits );
+    }
 
     return TRUE;
 }

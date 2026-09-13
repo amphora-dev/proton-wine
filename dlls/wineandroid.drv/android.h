@@ -71,6 +71,7 @@ extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct 
 extern void start_android_device(void);
 extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL client );
 extern struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl, float scale );
+extern struct ANativeWindow *get_amphora_parent_window( HWND hwnd );
 extern struct ANativeWindow *grab_ioctl_window( struct ANativeWindow *window );
 extern void release_ioctl_window( struct ANativeWindow *window );
 extern void destroy_ioctl_window( HWND hwnd, BOOL opengl );

@@ -325,6 +325,13 @@ static struct native_win_data *get_native_win_data( HWND hwnd, BOOL opengl )
     return NULL;
 }
 
+/* Amphora GDI flush: return parent ANW (mmap LOCK path), not ioctl/gralloc wrapper. */
+struct ANativeWindow *get_amphora_parent_window( HWND hwnd )
+{
+    struct native_win_data *data = get_native_win_data( hwnd, FALSE );
+    return data ? data->parent : NULL;
+}
+
 static struct native_win_data *get_ioctl_native_win_data( const struct ioctl_header *hdr )
 {
     return get_native_win_data( LongToHandle(hdr->hwnd), hdr->opengl );
@@ -585,52 +592,10 @@ NTSTATUS android_register_window( void *arg )
     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
     win->setSwapInterval( win, data->swap_interval );
     unwrap_java_call();
-    /* Amphora: prove ANW present path — LOCK/fill/UNLOCK parent right after bind. */
-    {
-        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-        ERR( "amphora register_window ANW try hwnd=%p win=%p amphora=%s\n",
-             hwnd, win, amphora ? amphora : "(null)" );
-        if (amphora && amphora[0] == '1')
-        {
-            ANativeWindow_Buffer buffer;
-            ARect rc;
-            int lock_ret, x, y, max_w, max_h;
-            DWORD color = 0xFFCC8844;
-            DWORD *bits;
-
-            memset( &buffer, 0, sizeof(buffer) );
-            memset( &rc, 0, sizeof(rc) );
-            wrap_java_call();
-            lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
-            ERR( "amphora register_window ANW LOCK hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
-                 hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
-            if (!lock_ret && buffer.bits && (uintptr_t)buffer.bits >= 0x1000 &&
-                buffer.width > 0 && buffer.height > 0 && buffer.stride > 0)
-            {
-                bits = buffer.bits;
-                max_w = buffer.width;
-                max_h = buffer.height;
-                if (max_w > buffer.stride) max_w = buffer.stride;
-                for (y = 0; y < max_h; y++)
-                    for (x = 0; x < max_w; x++)
-                        bits[y * buffer.stride + x] = color;
-                win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
-                ERR( "amphora register_window ANW fill hwnd=%p lock=%d %dx%d stride=%d color=0x%08x\n",
-                     hwnd, lock_ret, buffer.width, buffer.height, buffer.stride, color );
-            }
-            else if (!lock_ret)
-            {
-                if (!lock_ret) win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
-                ERR( "amphora register_window ANW LOCK empty hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
-                     hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
-            }
-            else
-                ERR( "amphora register_window ANW LOCK failed hwnd=%p lock=%d\n", hwnd, lock_ret );
-            unwrap_java_call();
-        }
-    }
-    /* PE register_window_callback posts WM_ANDROID_REFRESH after ANDROID_CALL. */
-    ERR( "amphora register_window defer REFRESH to PE hwnd=%p opengl=%d\n", hwnd, opengl );
+    /* Probe solid fill removed — GDI android_surface_flush posts to parent ANW.
+     * PE register_window_callback exposes/invalidates after ANDROID_CALL. */
+    ERR( "amphora register_window bound hwnd=%p opengl=%d parent=%p (no probe fill)\n",
+         hwnd, opengl, win );
     TRACE( "%p -> %p win %p\n", hwnd, data, win );
     return 0;
 }
