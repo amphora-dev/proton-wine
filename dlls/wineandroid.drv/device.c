@@ -567,6 +567,36 @@ NTSTATUS android_register_window( void *arg )
     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
     win->setSwapInterval( win, data->swap_interval );
     unwrap_java_call();
+    /* Amphora: prove ANW present path — LOCK/fill/UNLOCK parent right after bind. */
+    {
+        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+        if (amphora && amphora[0] == '1')
+        {
+            ANativeWindow_Buffer buffer;
+            ARect rc;
+            int lock_ret, x, y;
+            DWORD color = 0xFFCC8844;
+            DWORD *bits;
+
+            memset( &buffer, 0, sizeof(buffer) );
+            memset( &rc, 0, sizeof(rc) );
+            wrap_java_call();
+            lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
+            if (!lock_ret)
+            {
+                bits = buffer.bits;
+                for (y = 0; y < buffer.height; y++)
+                    for (x = 0; x < buffer.width; x++)
+                        bits[y * buffer.stride + x] = color;
+                win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
+                ERR( "amphora register_window ANW fill hwnd=%p lock=%d %dx%d stride=%d color=0x%08lx\n",
+                     hwnd, lock_ret, buffer.width, buffer.height, buffer.stride, (unsigned long)color );
+            }
+            else
+                ERR( "amphora register_window ANW LOCK failed hwnd=%p lock=%d\n", hwnd, lock_ret );
+            unwrap_java_call();
+        }
+    }
     /* PE register_window_callback posts WM_ANDROID_REFRESH after ANDROID_CALL. */
     ERR( "amphora register_window defer REFRESH to PE hwnd=%p opengl=%d\n", hwnd, opengl );
     TRACE( "%p -> %p win %p\n", hwnd, data, win );
