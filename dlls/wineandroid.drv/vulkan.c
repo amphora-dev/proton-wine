@@ -253,7 +253,17 @@ UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_
     if (!p_vkGetInstanceProcAddr)
         WARN( "vkGetInstanceProcAddr not found in vulkan library\n" );
 
-    ERR( "ANDROID_VulkanInit ok handle=%p gipa=%p\n", android_vulkan_handle, p_vkGetInstanceProcAddr );
+    {
+        Dl_info info;
+        const char *lib = "(unknown)";
+        const char *icd = getenv( "VK_ICD_FILENAMES" );
+        const char *adreno = getenv( "ADRENOTOOLS_DRIVER_NAME" );
+        if (p_vkGetInstanceProcAddr && dladdr( (void *)p_vkGetInstanceProcAddr, &info ) && info.dli_fname)
+            lib = info.dli_fname;
+        ERR( "ANDROID_VulkanInit ok handle=%p gipa=%p lib=%s icd=%s adrenotools=%s\n",
+             android_vulkan_handle, p_vkGetInstanceProcAddr, lib,
+             icd ? icd : "(unset)", adreno ? adreno : "(unset)" );
+    }
     TRACE( "using vulkan handle %p\n", android_vulkan_handle );
     *driver_funcs = &android_vulkan_driver_funcs;
     return STATUS_SUCCESS;
