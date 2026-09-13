@@ -156,21 +156,28 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
     /* Host smoke present proves the dedicated client ANW accepts WSI.
      * Sock-proxy ANW cannot enter aarch64 vkCreateAndroidSurfaceKHR (Box64),
      * and pastel headless WSI segfaults on caps — so PE QueuePresent cannot
-     * use host Vulkan WSI yet. Instead queue a PE-colored fill onto the same
-     * Amphora ANW (present ret=0 from PE path) then return SURFACE_LOST so
-     * PE does not assert; not OUT_OF_DATE short-circuit. */
+     * use host Vulkan WSI yet. After host WSI tears down it leaves the
+     * BufferQueue with no producer (dequeue -19); reconnect CPU API and fill
+     * PE green onto the same Amphora ANW (present ret=0) then SURFACE_LOST.
+     * Not OUT_OF_DATE short-circuit. */
     if (surface->window && surface->amphora_parent)
     {
         INT32 vkret[4] = { -999, -999, -999, -999 };
         int pret = amphora_parent_vk_present( surface->window, vkret );
         unsigned int rgba = 0xff408c0d; /* PE smoke clear ~RGB(13,140,64) */
-        int fret;
+        int cret, fret;
 
         ERR( "amphora host WSI hwnd=%p own-anw surface=%d swap=%d present=%d sock=%d\n",
              hwnd, vkret[0], vkret[1], vkret[2], pret );
+        /* Vulkan WSI disconnects producer (api:0); GDI/CPU fill needs API_CPU. */
+        cret = surface->window->perform( surface->window, NATIVE_WINDOW_API_CONNECT,
+                                         NATIVE_WINDOW_API_CPU );
+        surface->window->perform( surface->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT,
+                                  PF_RGBA_8888 );
         fret = amphora_parent_fill_rgba( surface->window, rgba );
-        ERR( "amphora PE QueuePresent→ANW hwnd=%p fill_rgba=0x%08x ret=%d\n",
-             hwnd, rgba, fret );
+        ERR( "amphora PE QueuePresent→ANW hwnd=%p fill_rgba=0x%08x connect=%d present ret=%d\n",
+             hwnd, rgba, cret, fret );
+        if (fret == 0) usleep( 2000000 ); /* hold PE fill for screencap */
         client_surface_release( &surface->client );
         return fret == 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
     }
