@@ -83,11 +83,12 @@ void update_gl_drawable( HWND hwnd )
     NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE );
 }
 
-static BOOL android_surface_create( HWND hwnd, int format, struct opengl_drawable **drawable )
+static BOOL android_surface_create( HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable )
 {
     struct gl_drawable *gl;
 
-    TRACE( "hwnd %p, format %d, drawable %p\n", hwnd, format, drawable );
+    TRACE( "hwnd %p, raw %u, format %d, drawable %p\n", hwnd, raw, format, drawable );
+    (void)raw;
 
     if (*drawable)
     {
