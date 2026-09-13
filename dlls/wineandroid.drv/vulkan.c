@@ -139,9 +139,8 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 
-    /* Host instance may lack VK_KHR_android_surface in ppEnabledExtensionNames until
-     * winevulkan adds platform "android" to UNEXPOSED_PLATFORMS / UNEXPOSED_EXTENSIONS
-     * and map_instance_extensions can set has_VK_KHR_android_surface. */
+    /* Host instance gets VK_KHR_android_surface via map_instance_extensions
+     * (android platform is UNEXPOSED in winevulkan make_vulkan). */
     info.window = surface->window;
     res = p_vkCreateAndroidSurfaceKHR( instance->host.instance, &info, NULL /* allocator */, handle );
     if (res != VK_SUCCESS)
@@ -169,13 +168,9 @@ static VkBool32 ANDROID_get_physical_device_presentation_support( struct vulkan_
 
 static void ANDROID_map_instance_extensions( struct vulkan_instance_extensions *extensions )
 {
-    /* Intended (needs winevulkan android platform exposure):
-     *   if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_android_surface = 1;
-     *   if (extensions->has_VK_KHR_android_surface) extensions->has_VK_KHR_win32_surface = 1;
-     * Until has_VK_KHR_android_surface exists, mark surface and keep win32_surface so
-     * clients still see WSI; host enable of android_surface remains incomplete. */
-    if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_surface = 1;
-    if (extensions->has_VK_KHR_surface) extensions->has_VK_KHR_win32_surface = 1;
+    /* Apps see Win32 WSI; host enables VK_KHR_android_surface (UNEXPOSED). */
+    if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_android_surface = 1;
+    if (extensions->has_VK_KHR_android_surface) extensions->has_VK_KHR_win32_surface = 1;
 }
 
 static void ANDROID_map_device_extensions( struct vulkan_device_extensions *extensions )

@@ -110,6 +110,12 @@ UNSUPPORTED_EXTENSIONS = [
     "VK_EXT_physical_device_drm",
     "VK_GOOGLE_surfaceless_query",
     "VK_SEC_amigo_profiling", # Angle specific.
+    # Android AHARDWAREBUFFER WSI/memory: winevulkan wow64 thunks emit bare
+    # AHardwareBuffer without a typedef (only "struct AHardwareBuffer" is in
+    # wine/vulkan.h), which fails as C on the NDK. Amphora only needs
+    # VK_KHR_android_surface (UNEXPOSED) for wineandroid.drv WSI.
+    "VK_ANDROID_external_memory_android_hardware_buffer",
+    "VK_ANDROID_external_format_resolve",
 
     # Extensions which require callback handling
     "VK_EXT_device_memory_report",
