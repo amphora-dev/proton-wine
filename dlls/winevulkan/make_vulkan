@@ -135,10 +135,12 @@ UNEXPOSED_EXTENSIONS = {
     "VK_KHR_external_semaphore_fd",
     "VK_KHR_wayland_surface",
     "VK_KHR_xlib_surface",
+    "VK_KHR_android_surface",
     "VK_MVK_macos_surface",
 }
 
 UNEXPOSED_PLATFORMS = {
+    "android",
     "macos",
     "metal",
     "wayland",

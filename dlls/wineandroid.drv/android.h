@@ -58,6 +58,13 @@ extern UINT ANDROID_OpenGLInit( UINT version, const struct opengl_funcs *opengl_
 
 
 /**************************************************************************
+ * Vulkan driver
+ */
+
+extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs );
+
+
+/**************************************************************************
  * Android pseudo-device
  */
 
