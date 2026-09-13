@@ -544,7 +544,11 @@ NTSTATUS android_register_window( void *arg )
     BOOL opengl = params->arg3;
     struct native_win_data *data = get_native_win_data( hwnd, opengl );
 
-    if (!win) return 0;  /* do nothing and hold on to the window until we get a new surface */
+    if (!win)
+    {
+        ERR( "amphora register_window clear/hold hwnd=%p opengl=%d (win=NULL)\n", hwnd, opengl );
+        return 0;  /* do nothing and hold on to the window until we get a new surface */
+    }
 
     if (!data || data->parent == win)
     {
@@ -555,6 +559,8 @@ NTSTATUS android_register_window( void *arg )
             ERR( "amphora register_window defer REFRESH to PE hwnd=%p opengl=%d (unchanged)\n",
                  hwnd, opengl );
         }
+        else
+            ERR( "amphora register_window no native data hwnd=%p opengl=%d\n", hwnd, opengl );
         TRACE( "%p -> %p win %p (unchanged)\n", hwnd, data, win );
         return 0;
     }
@@ -570,11 +576,13 @@ NTSTATUS android_register_window( void *arg )
     /* Amphora: prove ANW present path — LOCK/fill/UNLOCK parent right after bind. */
     {
         const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+        ERR( "amphora register_window ANW try hwnd=%p win=%p amphora=%s\n",
+             hwnd, win, amphora ? amphora : "(null)" );
         if (amphora && amphora[0] == '1')
         {
             ANativeWindow_Buffer buffer;
             ARect rc;
-            int lock_ret, x, y;
+            int lock_ret, x, y, max_w, max_h;
             DWORD color = 0xFFCC8844;
             DWORD *bits;
 
@@ -582,15 +590,26 @@ NTSTATUS android_register_window( void *arg )
             memset( &rc, 0, sizeof(rc) );
             wrap_java_call();
             lock_ret = win->perform( win, NATIVE_WINDOW_LOCK, &buffer, &rc );
-            if (!lock_ret)
+            ERR( "amphora register_window ANW LOCK hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
+                 hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
+            if (!lock_ret && buffer.bits && buffer.width > 0 && buffer.height > 0 && buffer.stride > 0)
             {
                 bits = buffer.bits;
-                for (y = 0; y < buffer.height; y++)
-                    for (x = 0; x < buffer.width; x++)
+                max_w = buffer.width;
+                max_h = buffer.height;
+                if (max_w > buffer.stride) max_w = buffer.stride;
+                for (y = 0; y < max_h; y++)
+                    for (x = 0; x < max_w; x++)
                         bits[y * buffer.stride + x] = color;
                 win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
-                ERR( "amphora register_window ANW fill hwnd=%p lock=%d %dx%d stride=%d color=0x%08lx\n",
-                     hwnd, lock_ret, buffer.width, buffer.height, buffer.stride, (unsigned long)color );
+                ERR( "amphora register_window ANW fill hwnd=%p lock=%d %dx%d stride=%d color=0x%08x\n",
+                     hwnd, lock_ret, buffer.width, buffer.height, buffer.stride, color );
+            }
+            else if (!lock_ret)
+            {
+                if (!lock_ret) win->perform( win, NATIVE_WINDOW_UNLOCK_AND_POST );
+                ERR( "amphora register_window ANW LOCK empty hwnd=%p lock=%d bits=%p %dx%d stride=%d\n",
+                     hwnd, lock_ret, buffer.bits, buffer.width, buffer.height, buffer.stride );
             }
             else
                 ERR( "amphora register_window ANW LOCK failed hwnd=%p lock=%d\n", hwnd, lock_ret );
