@@ -78,15 +78,6 @@ void init_monitors( int width, int height )
     virtual_screen_rect.bottom = height;
     monitor_rc_work = virtual_screen_rect;
 
-    /* Amphora skip-JNI leaves p_java_vm NULL, so wineserver never learns the
-     * CreateDesktop / HOST_DESKTOP_CHANGED size unless we notify it here.
-     * Call before the tray early-return; desktop HWND must not stay 0x0. */
-    {
-        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-        if (amphora && amphora[0] == '1' && amphora[1] == '\0' && width > 0 && height > 0)
-            NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
-    }
-
     if (!hwnd || !NtUserIsWindowVisible( hwnd )) return;
     if (!NtUserGetWindowRect( hwnd, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) )) return;
     if (rect.top) monitor_rc_work.bottom = rect.top;
