@@ -969,17 +969,25 @@ BOOL ANDROID_ProcessEvents( DWORD mask )
  */
 BOOL ANDROID_CreateWindow( HWND hwnd )
 {
-    TRACE( "%p\n", hwnd );
+    HWND desktop = NtUserGetDesktopWindow();
 
-    if (hwnd == NtUserGetDesktopWindow())
+    TRACE( "%p\n", hwnd );
+    ERR( "amphora CreateWindow hwnd=%p desktop=%p match=%d\n",
+         hwnd, desktop, hwnd == desktop );
+
+    if (hwnd == desktop)
     {
         struct android_win_data *data;
 
         init_event_queue();
         start_android_device();
+        ERR( "amphora CreateWindow start_android_device returned hwnd=%p\n", hwnd );
+        ERR( "amphora CreateWindow calling alloc_win_data hwnd=%p\n", hwnd );
         if (!(data = alloc_win_data( hwnd ))) return FALSE;
         release_win_data( data );
     }
+    else
+        ERR( "amphora CreateWindow skipped non-desktop hwnd=%p desktop=%p\n", hwnd, desktop );
     return TRUE;
 }
 

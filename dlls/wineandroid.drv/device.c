@@ -1963,7 +1963,11 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
         status = NtCreateFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
                                FILE_NON_DIRECTORY_FILE, NULL, 0 );
-        if (status) return -ENOENT;
+        if (status)
+        {
+            ERR( "amphora android_ioctl NtCreateFile WineAndroid status=%lx\n", status );
+            return -ENOENT;
+        }
         if (InterlockedCompareExchangePointer( &device, file, NULL )) NtClose( file );
     }
 

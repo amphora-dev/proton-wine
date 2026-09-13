@@ -73,16 +73,21 @@ static DWORD CALLBACK device_thread( void *arg )
 
     TRACE( "starting process %lx\n", GetCurrentProcessId() );
 
-    if (ANDROID_CALL( java_init, NULL )) return 0;  /* not running under Java */
+    status = ANDROID_CALL( java_init, NULL );
+    ERR( "amphora device_thread java_init status=%lx\n", status );
+    if (status) return 0;  /* not running under Java */
 
     RtlInitUnicodeString( &nameW, driver_nameW );
     if ((status = IoCreateDriver( &nameW, init_android_driver )))
     {
+        ERR( "amphora device_thread IoCreateDriver status=%lx\n", status );
         FIXME( "failed to create driver error %lx\n", status );
         return status;
     }
+    ERR( "amphora device_thread IoCreateDriver status=%lx\n", status );
 
     stop_event = CreateEventW( NULL, TRUE, FALSE, NULL );
+    ERR( "amphora device_thread before SetEvent start_event=%p\n", start_event );
     SetEvent( start_event );
 
     ret = wine_ntoskrnl_main_loop( stop_event );
