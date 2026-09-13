@@ -643,6 +643,8 @@ done:
 		DWORD exitcode;
 		HANDLE hJob;
 		JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+		const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+		BOOL amphora_mode = amphora && amphora[0] == '1' && !amphora[1];
 
 		SetConsoleCtrlHandler(NULL, TRUE);
 		hJob = CreateJobObjectA(NULL, NULL);
@@ -651,11 +653,16 @@ done:
 		 * (The idea is to allow to kill (from a Unix standpoint) a created Windows
 		 * process (here start.exe), and that the unix-kill of start.exe will be also terminate
 		 * start.exe's child process).
+		 * Amphora: omit KILL_ON_JOB_CLOSE so explorer survives start.exe exit (LdrShutdown),
+		 * keeping device_thread alive past java_init through IoCreateDriver.
 		 */
 		memset(&info, 0, sizeof(info));
-		info.BasicLimitInformation.LimitFlags =
-                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
-                    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+		if (!amphora_mode)
+                    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		else
+                    ERR( "amphora start.exe skip KILL_ON_JOB_CLOSE, wait pid=%lu\n",
+                         (unsigned long)GetProcessId( opts.sei.hProcess ) );
 		SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &info, sizeof(info));
 		AssignProcessToJobObject(hJob, opts.sei.hProcess);
 
