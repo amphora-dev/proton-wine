@@ -46,6 +46,10 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(android);
 
+/* Defined for init.c; pin still initializes it even though the
+ * client-surface GL path no longer locks around drawables. */
+pthread_mutex_t drawable_mutex;
+
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct client_surface_funcs android_client_surface_funcs;
