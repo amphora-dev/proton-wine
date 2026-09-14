@@ -4,8 +4,9 @@
  * Wine's x86_64 sock-proxy ANW cannot be passed through Box64 into host
  * vkCreateAndroidSurfaceKHR (vtable is guest-ABI). This helper lives in the
  * box64 process as a native ARM64 .so: it rebuilds an aarch64 ANativeWindow
- * over the same Amphora client sock and creates the Android surface on
- * Wine's host VkInstance so PE QueuePresent DEQUEUE/QUEUEs that hwnd ANW.
+ * over the same Amphora client sock and creates the Android surface on THAT
+ * hwnd ANW (no ImageReader blit hop) so PE QueuePresent DEQUEUE/QUEUEs the
+ * dedicated Amphora window Surface directly.
  */
 #include <android/log.h>
 #include <dlfcn.h>
@@ -15,7 +16,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -258,6 +258,26 @@ static int win_dequeue(struct ANativeWindow *window, struct ANativeWindowBuffer 
             pthread_mutex_unlock(&win->lock); return -EIO;
         }
     }
+    /* libvulkan swapchain matches images by ANativeWindowBuffer* identity.
+     * Reuse the cached slot pointer; closing the extra SCM_RIGHTS dups. */
+    if (hdr.buffer_id >= 0 && hdr.buffer_id < NB_CACHED_BUFFERS &&
+        win->bufs[hdr.buffer_id] &&
+        win->bufs[hdr.buffer_id]->generation == hdr.generation) {
+        int i;
+        for (i = 0; i < n_fds; i++) close(fds[i]);
+        free(ints);
+        buf = win->bufs[hdr.buffer_id];
+        buf->buffer.width = hdr.width;
+        buf->buffer.height = hdr.height;
+        buf->buffer.stride = hdr.stride;
+        buf->buffer.format = hdr.format;
+        buf->buffer.usage = hdr.usage;
+        *out = &buf->buffer;
+        pthread_mutex_unlock(&win->lock);
+        LOGI("dequeue id=%d REUSE %dx%d fmt=%d usage=0x%x ptr=%p",
+             hdr.buffer_id, hdr.width, hdr.height, hdr.format, hdr.usage, (void *)buf);
+        return 0;
+    }
     nh_size = sizeof(native_handle_t) + sizeof(int) * (size_t)(hdr.numFds + hdr.numInts);
     nh = malloc(nh_size);
     buf = calloc(1, sizeof(*buf));
@@ -294,7 +314,8 @@ static int win_dequeue(struct ANativeWindow *window, struct ANativeWindowBuffer 
     }
     *out = &buf->buffer;
     pthread_mutex_unlock(&win->lock);
-    LOGI("dequeue id=%d %dx%d fmt=%d usage=0x%x", hdr.buffer_id, hdr.width, hdr.height, hdr.format, hdr.usage);
+    LOGI("dequeue id=%d NEW %dx%d fmt=%d usage=0x%x ptr=%p",
+         hdr.buffer_id, hdr.width, hdr.height, hdr.format, hdr.usage, (void *)buf);
     return 0;
 }
 
@@ -381,7 +402,64 @@ static int win_perform(struct ANativeWindow *window, int operation, ...)
     struct amphora_win *win = (struct amphora_win *)window;
     int32_t cmd = AMPHORA_BUF_PERFORM, op = operation, nargs = 0, args[4], ret;
     va_list ap;
+    /* AOSP NATIVE_WINDOW_GET_CONSUMER_USAGE64 / SET_USAGE64 — out/in uint64 cannot
+     * ride the int32 sock protocol; satisfy locally so pastel/libvulkan can create
+     * an Android surface on this sock-proxy hwnd ANW (SurfaceView consumer 0x900). */
+    enum { NW_SET_USAGE64 = 30, NW_GET_CONSUMER_USAGE64 = 31,
+           NW_SET_SHARED_BUFFER_MODE = 21, NW_SET_AUTO_REFRESH = 22 };
     va_start(ap, operation);
+    if (operation == NW_GET_CONSUMER_USAGE64) {
+        uint64_t *out = va_arg(ap, uint64_t *);
+        va_end(ap);
+        if (out) *out = 0x900ull; /* GPU_SAMPLED | COMPOSER_OVERLAY (blit-era usage) */
+        LOGI("perform GET_CONSUMER_USAGE64 -> 0x900 (local stub)");
+        return 0;
+    }
+    if (operation == NW_SET_USAGE64) {
+        uint64_t usage = va_arg(ap, uint64_t);
+        va_end(ap);
+        op = NATIVE_WINDOW_SET_USAGE;
+        args[0] = (int32_t)usage;
+        nargs = 1;
+        LOGI("perform SET_USAGE64 0x%llx -> SET_USAGE 0x%x",
+             (unsigned long long)usage, args[0]);
+        goto send;
+    }
+    /* GET ops with pointer out-params cannot ride the int32 sock protocol. */
+    if (operation == 23) { /* GET_REFRESH_CYCLE_DURATION */
+        int64_t *out = va_arg(ap, int64_t *);
+        va_end(ap);
+        if (out) *out = 16666666; /* 60 Hz */
+        LOGI("perform GET_REFRESH_CYCLE_DURATION -> 16666666");
+        return 0;
+    }
+    if (operation == 24) { /* GET_NEXT_FRAME_ID */
+        static uint64_t next_fid = 1;
+        uint64_t *out = va_arg(ap, uint64_t *);
+        va_end(ap);
+        if (out) *out = next_fid++;
+        return 0;
+    }
+    if (operation == 28 || operation == 29) { /* GET_WIDE_COLOR / GET_HDR */
+        int *out = va_arg(ap, int *);
+        va_end(ap);
+        if (out) *out = 0;
+        return 0;
+    }
+    if (operation == 36 || operation == 38 || operation == 39) {
+        int64_t *out = va_arg(ap, int64_t *);
+        va_end(ap);
+        if (out) *out = 0;
+        return 0;
+    }
+    if (operation == NW_SET_SHARED_BUFFER_MODE || operation == NW_SET_AUTO_REFRESH ||
+        operation == 19 /* SET_BUFFERS_DATASPACE */ ||
+        operation == 35 /* SET_AUTO_PREROTATION */ ||
+        operation == 37 /* SET_DEQUEUE_TIMEOUT */) {
+        va_end(ap);
+        LOGI("perform op=%d (local no-op ok)", operation);
+        return 0;
+    }
     switch (operation) {
     case NATIVE_WINDOW_SET_USAGE:
     case NATIVE_WINDOW_SET_BUFFERS_TRANSFORM:
@@ -403,9 +481,11 @@ static int win_perform(struct ANativeWindow *window, int operation, ...)
         nargs = 0; break;
     default:
         va_end(ap);
-        return -ENOENT;
+        LOGI("perform op=%d (unknown, local no-op ok)", operation);
+        return 0;
     }
     va_end(ap);
+send:
     pthread_mutex_lock(&win->lock);
     if (write_full(win->sock, &cmd, sizeof(cmd)) ||
         write_full(win->sock, &op, sizeof(op)) ||
@@ -443,110 +523,21 @@ static struct ANativeWindow *make_win(int sock)
     return &win->win;
 }
 
-/* Real NDK ImageReader ANW for wine's VkInstance; blit presents onto Amphora sock ANW. */
-#define AIMAGE_FORMAT_RGBA_8888 0x1
-#define AMEDIA_OK 0
-
-typedef struct AImageReader AImageReader;
-typedef struct AImage AImage;
-typedef int32_t media_status_t;
-typedef void (*AImageReader_ImageCallback)(void *context, AImageReader *reader);
-typedef struct AImageReader_ImageListener {
-    void *context;
-    AImageReader_ImageCallback onImageAvailable;
-} AImageReader_ImageListener;
-
-static AImageReader *g_reader;
-static struct ANativeWindow *g_anw; /* amphora sock proxy for blit */
-static int g_w, g_h;
-
-static void blit_image_to_anw(AImageReader *reader)
-{
-    static media_status_t (*p_acquire)(AImageReader *, AImage **);
-    static media_status_t (*p_plane)(const AImage *, int, uint8_t **, int *);
-    static media_status_t (*p_row)(const AImage *, int, int32_t *);
-    static void (*p_delete)(AImage *);
-    static int loaded;
-    AImage *img = NULL;
-    uint8_t *src = NULL;
-    int src_len = 0;
-    int32_t src_stride = 0;
-    struct ANativeWindowBuffer *buf = NULL;
-    unsigned char *dst;
-    int y, copy_w, copy_h, dst_stride;
-    void *bits = NULL;
-
-    if (!loaded) {
-        void *m = dlopen("libmediandk.so", RTLD_NOW);
-        if (!m) { LOGE("libmediandk for blit: %s", dlerror()); return; }
-        p_acquire = dlsym(m, "AImageReader_acquireLatestImage");
-        p_plane = dlsym(m, "AImage_getPlaneData");
-        p_row = dlsym(m, "AImage_getPlaneRowStride");
-        p_delete = dlsym(m, "AImage_delete");
-        loaded = 1;
-    }
-    if (!p_acquire || p_acquire(reader, &img) != AMEDIA_OK || !img) return;
-    if (!p_plane || p_plane(img, 0, &src, &src_len) != AMEDIA_OK || !src) {
-        if (p_delete) p_delete(img);
-        return;
-    }
-    if (p_row) p_row(img, 0, &src_stride);
-    if (src_stride <= 0) src_stride = g_w * 4;
-    if (!g_anw) { if (p_delete) p_delete(img); return; }
-    {
-        int cret = g_anw->perform(g_anw, 13, 2); /* API_CONNECT CPU */
-        int fret = g_anw->perform(g_anw, 9, 1);  /* SET_BUFFERS_FORMAT RGBA */
-        int dret = g_anw->perform(g_anw, 8, g_w, g_h); /* DIMENSIONS */
-        LOGI("blit connect=%d format=%d dim=%d", cret, fret, dret);
-    }
-    if (win_dequeue(g_anw, &buf, NULL)) {
-        LOGE("blit dequeue failed");
-        if (p_delete) p_delete(img);
-        return;
-    }
-    /* mmap first handle fd */
-    if (buf->handle && buf->handle->numFds > 0) {
-        size_t sz = (size_t)buf->stride * (size_t)buf->height * 4;
-        bits = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, buf->handle->data[0], 0);
-        if (bits == MAP_FAILED) bits = NULL;
-    }
-    if (bits) {
-        copy_h = buf->height < g_h ? buf->height : g_h;
-        copy_w = buf->width < g_w ? buf->width : g_w;
-        dst_stride = buf->stride * 4;
-        dst = bits;
-        for (y = 0; y < copy_h; y++)
-            memcpy(dst + (size_t)y * dst_stride, src + (size_t)y * src_stride, (size_t)copy_w * 4);
-        munmap(bits, (size_t)buf->stride * (size_t)buf->height * 4);
-        LOGI("blit PE→ANW %dx%d src_stride=%d dst_stride=%d", copy_w, copy_h, src_stride, buf->stride);
-    } else {
-        LOGE("blit mmap failed");
-    }
-    win_queue(g_anw, buf, -1);
-    if (p_delete) p_delete(img);
-}
-
-static void on_image(void *ctx, AImageReader *reader)
-{
-    (void)ctx;
-    blit_image_to_anw(reader);
-}
-
+/* Present PE Vulkan onto the Amphora hwnd sock-proxy ANW directly (no ImageReader
+ * intermediate). Host already DEQUEUE/QUEUEs that hwnd Surface; the aarch64 helper
+ * only rebuilds a native-ABI ANativeWindow over the same client sock so Box64 can
+ * enter vkCreateAndroidSurfaceKHR. */
 int32_t amphora_wsi_create_android_surface(uint64_t vk_instance, int32_t sock_fd, uint64_t *out_surface)
 {
     VkInstance inst = (VkInstance)(uintptr_t)vk_instance;
     int dupfd, w = 640, h = 480, q;
     struct ANativeWindow *proxy;
-    void *lib, *media, *ndk_win = NULL;
+    void *lib;
     PFN_vkGetInstanceProcAddr gipa;
     PFN_bridge_vkCreateAndroidSurfaceKHR create;
     VkAndroidSurfaceCreateInfoKHR_bridge info;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkResult r;
-    media_status_t (*p_new)(int32_t, int32_t, int32_t, int32_t, AImageReader **);
-    media_status_t (*p_getwin)(AImageReader *, void **);
-    media_status_t (*p_listen)(AImageReader *, AImageReader_ImageListener *);
-    AImageReader_ImageListener lis;
 
     if (!out_surface) return -EINVAL;
     *out_surface = 0;
@@ -560,53 +551,38 @@ int32_t amphora_wsi_create_android_surface(uint64_t vk_instance, int32_t sock_fd
     if (!proxy) { LOGE("make_win failed"); return -ENOMEM; }
     if (!proxy->query(proxy, 0, &q) && q > 0) w = q;
     if (!proxy->query(proxy, 1, &q) && q > 0) h = q;
-    g_w = w; g_h = h; g_anw = proxy;
 
-    media = dlopen("libmediandk.so", RTLD_NOW);
-    if (!media) {
-        LOGE("dlopen libmediandk: %s", dlerror());
+    lib = dlopen("libvulkan.so", RTLD_NOW);
+    if (!lib) {
+        LOGE("dlopen libvulkan: %s", dlerror());
         proxy->common.decRef(&proxy->common);
         return -ENOENT;
     }
-    p_new = dlsym(media, "AImageReader_new");
-    p_getwin = dlsym(media, "AImageReader_getWindow");
-    p_listen = dlsym(media, "AImageReader_setImageListener");
-    if (!p_new || !p_getwin) {
-        LOGE("AImageReader symbols missing");
+    gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+    if (!gipa) {
+        LOGE("no GIPA");
+        proxy->common.decRef(&proxy->common);
+        return -ENOENT;
+    }
+    create = (PFN_bridge_vkCreateAndroidSurfaceKHR)gipa(inst, "vkCreateAndroidSurfaceKHR");
+    if (!create) {
+        LOGE("no vkCreateAndroidSurfaceKHR on inst=%p", (void *)inst);
         proxy->common.decRef(&proxy->common);
         return -ENOSYS;
     }
-    if (p_new(w, h, AIMAGE_FORMAT_RGBA_8888, 3, &g_reader) != AMEDIA_OK || !g_reader) {
-        LOGE("AImageReader_new %dx%d failed", w, h);
-        proxy->common.decRef(&proxy->common);
-        return -EIO;
-    }
-    if (p_getwin(g_reader, &ndk_win) != AMEDIA_OK || !ndk_win) {
-        LOGE("AImageReader_getWindow failed");
-        proxy->common.decRef(&proxy->common);
-        return -EIO;
-    }
-    if (p_listen) {
-        memset(&lis, 0, sizeof(lis));
-        lis.onImageAvailable = on_image;
-        p_listen(g_reader, &lis);
-    }
-    LOGI("ImageReader %dx%d win=%p proxy=%p", w, h, ndk_win, (void *)proxy);
-
-    lib = dlopen("libvulkan.so", RTLD_NOW);
-    if (!lib) { LOGE("dlopen libvulkan: %s", dlerror()); return -ENOENT; }
-    gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
-    if (!gipa) { LOGE("no GIPA"); return -ENOENT; }
-    create = (PFN_bridge_vkCreateAndroidSurfaceKHR)gipa(inst, "vkCreateAndroidSurfaceKHR");
-    if (!create) { LOGE("no vkCreateAndroidSurfaceKHR on inst=%p", (void *)inst); return -ENOSYS; }
 
     memset(&info, 0, sizeof(info));
     info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
-    info.window = ndk_win;
+    info.window = proxy;
     r = create(inst, &info, NULL, &surface);
-    LOGI("vkCreateAndroidSurfaceKHR inst=%p imgwin=%p res=%d surface=%p",
-         (void *)inst, ndk_win, (int)r, (void *)(uintptr_t)surface);
-    if (r != VK_SUCCESS) return (int32_t)r;
+    LOGI("vkCreateAndroidSurfaceKHR DIRECT hwnd-ANW (no ImageReader) inst=%p proxy=%p %dx%d res=%d surface=%p",
+         (void *)inst, (void *)proxy, w, h, (int)r, (void *)(uintptr_t)surface);
+    if (r != VK_SUCCESS) {
+        proxy->common.decRef(&proxy->common);
+        return (int32_t)r;
+    }
+    /* Surface owns a ref via incRef inside the driver; keep our ref so the
+     * sock-proxy stays alive for the lifetime of the VkSurfaceKHR. */
     *out_surface = (uint64_t)(uintptr_t)surface;
     return 0;
 }

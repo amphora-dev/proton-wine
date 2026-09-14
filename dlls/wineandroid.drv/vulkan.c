@@ -206,9 +206,9 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
 
     /* Sock-proxy ANW is x86_64/Box64 and cannot enter aarch64
      * vkCreateAndroidSurfaceKHR. The aarch64 helper rebuilds an ANW over the
-     * same Amphora client sock and creates the host Android surface on Wine's
-     * VkInstance so PE QueuePresent DEQUEUE/QUEUEs that dedicated hwnd ANW.
-     * No host-smoke CPU fill and no SURFACE_LOST short-circuit. */
+     * same Amphora client sock and creates the Android surface on THAT hwnd
+     * ANW (no ImageReader blit) so PE QueuePresent DEQUEUE/QUEUEs the
+     * dedicated Amphora window Surface directly. */
     if (surface->window && surface->amphora_parent)
     {
         int sock = amphora_native_window_sock( surface->window );
