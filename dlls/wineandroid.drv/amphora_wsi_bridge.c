@@ -50,10 +50,15 @@ typedef struct VkAndroidSurfaceCreateInfoKHR_bridge {
 typedef VkResult (*PFN_bridge_vkCreateAndroidSurfaceKHR)(VkInstance, const VkAndroidSurfaceCreateInfoKHR_bridge *,
                                                          const VkAllocationCallbacks *, VkSurfaceKHR *);
 
+/* Wineandroid loads liblog via dlsym into p__android_log_print (init.c /
+ * android.h). Do not call bare __android_log_print — that needs -llog and
+ * breaks wineandroid.so link. Null-check: this file's ctor may run before
+ * init.c LOAD_FUNCPTR. */
+extern typeof(__android_log_print) *p__android_log_print;
 #define LOG_TAG "WineAndroidWsi"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) do { if (p__android_log_print) p__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); } while (0)
+#define LOGW(...) do { if (p__android_log_print) p__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); } while (0)
+#define LOGE(...) do { if (p__android_log_print) p__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); } while (0)
 
 #define ANDROID_NATIVE_MAKE_CONSTANT(a,b,c,d) \
     (((unsigned)(a)<<24)|((unsigned)(b)<<16)|((unsigned)(c)<<8)|(unsigned)(d))
