@@ -1,0 +1,13 @@
+# Local Autotools / make_vulkan / syscall stubs — regenerate in CI/WCP, never commit.
+/configure
+/include/config.h.in
+/include/wine/vulkan.h
+/dlls/ntdll/ntsyscalls.h
+/dlls/win32u/win32syscalls.h
+/dlls/vulkan-1/vulkan-1.spec
+/dlls/winevulkan/loader_thunks.c
+/dlls/winevulkan/loader_thunks.h
+/dlls/winevulkan/vulkan_thunks.c
+/dlls/winevulkan/vulkan_thunks.h
+/dlls/winevulkan/winevulkan.json
+/dlls/winevulkan/winevulkan.spec

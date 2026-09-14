@@ -823,7 +823,6 @@ static void create_desktop_window( HWND hwnd )
 #define AMPHORA_BUF_QUERY     4
 #define AMPHORA_BUF_PERFORM   5
 #define AMPHORA_BUF_SET_SWAP  6
-#define AMPHORA_BUF_VK_PRESENT 7
 
 static int amphora_host_fd = -1;
 static int amphora_mode;
@@ -1382,25 +1381,6 @@ static int amphora_parent_perform( struct ANativeWindow *window, int operation, 
     }
     pthread_mutex_unlock( &win->lock );
     return ret;
-}
-
-int amphora_parent_vk_present( struct ANativeWindow *window, INT32 reply[4] )
-{
-    struct amphora_parent_window *win = (struct amphora_parent_window *)window;
-    INT32 cmd = AMPHORA_BUF_VK_PRESENT;
-    INT32 local[4] = { -1, -1, -1, -1 };
-
-    if (!win || win->sock < 0) return -EBADF;
-    pthread_mutex_lock( &win->lock );
-    if (amphora_write_full( win->sock, &cmd, sizeof(cmd) ) ||
-        amphora_read_full( win->sock, local, sizeof(local) ))
-    {
-        pthread_mutex_unlock( &win->lock );
-        return -EIO;
-    }
-    pthread_mutex_unlock( &win->lock );
-    if (reply) memcpy( reply, local, sizeof(local) );
-    return local[2];
 }
 
 int amphora_parent_fill_rgba( struct ANativeWindow *window, unsigned int rgba )

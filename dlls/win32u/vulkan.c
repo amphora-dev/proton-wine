@@ -2680,7 +2680,13 @@ fail:
 
 static BOOL surface_get_fshack_dpi( struct surface *surface )
 {
-    UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
+    UINT dpi, raw;
+
+    /* Amphora AHB-import HWND path: never engage fs_hack compute blit. */
+    if (amphora_wsi_wanted()) return 0;
+
+    dpi = NtUserGetDpiForWindow( surface->hwnd );
+    raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
     return fshack_enabled && dpi != raw ? raw : 0;
 }
 

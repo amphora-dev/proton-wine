@@ -73,7 +73,6 @@ extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL c
 extern struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl, float scale );
 extern struct ANativeWindow *get_amphora_parent_window( HWND hwnd );
 extern struct ANativeWindow *get_amphora_client_window( HWND hwnd );
-extern int amphora_parent_vk_present( struct ANativeWindow *window, INT32 reply[4] );
 extern int amphora_parent_fill_rgba( struct ANativeWindow *window, unsigned int rgba );
 extern int amphora_native_window_sock( struct ANativeWindow *window );
 extern struct ANativeWindow *grab_ioctl_window( struct ANativeWindow *window );
