@@ -6,6 +6,7 @@ UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 # Amphora hosts the Activity itself. Do not build Wine's wine-debug.apk
 # (EXTRA_TARGETS + gradle); that target is unused and breaks headless WCP CI.
 SOURCES = \
+	amphora_wsi_bridge.c \
 	device.c \
 	dllmain.c \
 	init.c \
