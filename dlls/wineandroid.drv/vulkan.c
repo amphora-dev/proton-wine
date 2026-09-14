@@ -61,6 +61,7 @@ typedef VkResult (*PFN_android_vkCreateAndroidSurfaceKHR)( VkInstance, const VkA
 typedef void *(*PFN_android_vkGetInstanceProcAddr)( VkInstance, const char * );
 
 static void *android_vulkan_handle;
+extern void amphora_note_acquire_signal( VkSemaphore host_sem, VkFence host_fence );
 static PFN_android_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
 
 static const struct vulkan_driver_funcs android_vulkan_driver_funcs;
@@ -319,6 +320,269 @@ static const struct vulkan_driver_funcs android_vulkan_driver_funcs =
     .p_map_instance_extensions = ANDROID_map_instance_extensions,
     .p_map_device_extensions = ANDROID_map_device_extensions,
 };
+
+
+/* knife13: source-path AHB swapchain. x86_64 wine cannot dlsym aarch64
+ * libamphora_wsi.so; IPC to wsi-sc-%pid.sock which calls amphora_ahb_sc_*.
+ * No runtime table/GIPA/GDPA hooks. */
+#define AMPHORA_SC_SOCK_FMT "/data/user/0/app.amphora/files/wineandroid/wsi-sc-%d.sock"
+enum {
+    AMPHORA_SC_OP_CREATE = 1,
+    AMPHORA_SC_OP_DESTROY = 2,
+    AMPHORA_SC_OP_GET_IMAGES = 3,
+    AMPHORA_SC_OP_ACQUIRE = 4,
+    AMPHORA_SC_OP_PRESENT = 5,
+    AMPHORA_SC_OP_STASH = 6,
+};
+
+static int amphora_sc_connect(void)
+{
+    char path[128];
+    struct sockaddr_un addr;
+    int fd, i;
+    snprintf( path, sizeof(path), AMPHORA_SC_SOCK_FMT, (int)getpid() );
+    for (i = 0; i < 50; i++)
+    {
+        fd = socket( AF_UNIX, SOCK_STREAM, 0 );
+        if (fd < 0) return -1;
+        memset( &addr, 0, sizeof(addr) );
+        addr.sun_family = AF_UNIX;
+        memcpy( addr.sun_path, path, strlen(path) + 1 );
+        if (!connect( fd, (struct sockaddr *)&addr, sizeof(addr) )) return fd;
+        close( fd );
+        usleep( 40000 );
+    }
+    ERR( "amphora sc connect failed %s errno=%d\n", path, errno );
+    return -1;
+}
+
+static int amphora_sc_io_write( int fd, const void *buf, size_t n )
+{
+    const char *p = buf;
+    while (n)
+    {
+        ssize_t w = write( fd, p, n );
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int amphora_sc_io_read( int fd, void *buf, size_t n )
+{
+    char *p = buf;
+    while (n)
+    {
+        ssize_t r = read( fd, p, n );
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void amphora_wine_vkStashDevice( VkDevice device, VkPhysicalDevice phys )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_STASH, ret = -1;
+    uint64_t d = (uint64_t)(UINT_PTR)device, p = (uint64_t)(UINT_PTR)phys;
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+    if (!amphora || amphora[0] != '1' || amphora[1] != '\0') return;
+    fd = amphora_sc_connect();
+    if (fd < 0) return;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &d, sizeof(d) ) ||
+        amphora_sc_io_write( fd, &p, sizeof(p) ) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ))
+        ERR( "amphora sc stash ipc failed\n" );
+    close( fd );
+}
+
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkCreateSwapchainKHR( VkDevice device, const VkSwapchainCreateInfoKHR *info,
+                                            const VkAllocationCallbacks *alloc, VkSwapchainKHR *out )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_CREATE, ret;
+    uint64_t d, phys = 0, surface, sc = 0;
+    uint32_t minImageCount, width, height, format, usage, sharingMode;
+    uint32_t preTransform, compositeAlpha, presentMode, clipped, qcount = 0;
+    (void)alloc;
+    if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    fd = amphora_sc_connect();
+    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    d = (uint64_t)(UINT_PTR)device;
+    surface = (uint64_t)(UINT_PTR)info->surface;
+    minImageCount = info->minImageCount;
+    width = info->imageExtent.width;
+    height = info->imageExtent.height;
+    format = (uint32_t)info->imageFormat;
+    usage = info->imageUsage;
+    sharingMode = (uint32_t)info->imageSharingMode;
+    preTransform = (uint32_t)info->preTransform;
+    compositeAlpha = (uint32_t)info->compositeAlpha;
+    presentMode = (uint32_t)info->presentMode;
+    clipped = info->clipped ? 1u : 0u;
+    qcount = info->queueFamilyIndexCount;
+    if (qcount > 8) qcount = 8;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &d, sizeof(d) ) ||
+        amphora_sc_io_write( fd, &phys, sizeof(phys) ) ||
+        amphora_sc_io_write( fd, &surface, sizeof(surface) ) ||
+        amphora_sc_io_write( fd, &minImageCount, sizeof(minImageCount) ) ||
+        amphora_sc_io_write( fd, &width, sizeof(width) ) ||
+        amphora_sc_io_write( fd, &height, sizeof(height) ) ||
+        amphora_sc_io_write( fd, &format, sizeof(format) ) ||
+        amphora_sc_io_write( fd, &usage, sizeof(usage) ) ||
+        amphora_sc_io_write( fd, &sharingMode, sizeof(sharingMode) ) ||
+        amphora_sc_io_write( fd, &preTransform, sizeof(preTransform) ) ||
+        amphora_sc_io_write( fd, &compositeAlpha, sizeof(compositeAlpha) ) ||
+        amphora_sc_io_write( fd, &presentMode, sizeof(presentMode) ) ||
+        amphora_sc_io_write( fd, &clipped, sizeof(clipped) ) ||
+        amphora_sc_io_write( fd, &qcount, sizeof(qcount) ) ||
+        (qcount && amphora_sc_io_write( fd, info->pQueueFamilyIndices, sizeof(uint32_t) * qcount )) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ) ||
+        amphora_sc_io_read( fd, &sc, sizeof(sc) ))
+    {
+        ERR( "amphora sc CreateSwapchain ipc failed\n" );
+        close( fd );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    close( fd );
+    *out = (VkSwapchainKHR)(UINT_PTR)sc;
+    ERR( "amphora sc CreateSwapchain ret=%d sc=0x%s\n", ret, wine_dbgstr_longlong( sc ) );
+    return (VkResult)ret;
+}
+
+__attribute__((visibility("default")))
+void amphora_wine_vkDestroySwapchainKHR( VkDevice device, VkSwapchainKHR swapchain,
+                                         const VkAllocationCallbacks *alloc )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_DESTROY, ret = 0;
+    uint64_t d = (uint64_t)(UINT_PTR)device, sc = (uint64_t)(UINT_PTR)swapchain;
+    (void)alloc;
+    fd = amphora_sc_connect();
+    if (fd < 0) return;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &d, sizeof(d) ) ||
+        amphora_sc_io_write( fd, &sc, sizeof(sc) ) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ))
+        ERR( "amphora sc DestroySwapchain ipc failed\n" );
+    close( fd );
+}
+
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkGetSwapchainImagesKHR( VkDevice device, VkSwapchainKHR swapchain,
+                                               uint32_t *count, VkImage *images )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_GET_IMAGES, ret;
+    uint64_t d = (uint64_t)(UINT_PTR)device, sc = (uint64_t)(UINT_PTR)swapchain;
+    uint32_t n, want, i;
+    if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+    fd = amphora_sc_connect();
+    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    n = *count;
+    want = images ? 1u : 0u;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &d, sizeof(d) ) ||
+        amphora_sc_io_write( fd, &sc, sizeof(sc) ) ||
+        amphora_sc_io_write( fd, &n, sizeof(n) ) ||
+        amphora_sc_io_write( fd, &want, sizeof(want) ) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ) ||
+        amphora_sc_io_read( fd, &n, sizeof(n) ))
+    {
+        close( fd );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (images)
+    {
+        for (i = 0; i < n; i++)
+        {
+            uint64_t img = 0;
+            if (amphora_sc_io_read( fd, &img, sizeof(img) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+            if (i < *count) images[i] = (VkImage)(UINT_PTR)img;
+        }
+    }
+    close( fd );
+    *count = n;
+    return (VkResult)ret;
+}
+
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkAcquireNextImageKHR( VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                             VkSemaphore semaphore, VkFence fence, uint32_t *index )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_ACQUIRE, ret;
+    uint64_t d = (uint64_t)(UINT_PTR)device, sc = (uint64_t)(UINT_PTR)swapchain;
+    uint64_t to = timeout, sem = (uint64_t)(UINT_PTR)semaphore, fen = (uint64_t)(UINT_PTR)fence;
+    uint32_t idx = 0;
+    if (!index) return VK_ERROR_INITIALIZATION_FAILED;
+    fd = amphora_sc_connect();
+    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &d, sizeof(d) ) ||
+        amphora_sc_io_write( fd, &sc, sizeof(sc) ) ||
+        amphora_sc_io_write( fd, &to, sizeof(to) ) ||
+        amphora_sc_io_write( fd, &sem, sizeof(sem) ) ||
+        amphora_sc_io_write( fd, &fen, sizeof(fen) ) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ) ||
+        amphora_sc_io_read( fd, &idx, sizeof(idx) ))
+    {
+        close( fd );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    close( fd );
+    *index = idx;
+    if (ret == VK_SUCCESS)
+        amphora_note_acquire_signal( semaphore, fence );
+    return (VkResult)ret;
+}
+
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkQueuePresentKHR( VkQueue queue, const VkPresentInfoKHR *info )
+{
+    int fd;
+    int32_t op = AMPHORA_SC_OP_PRESENT, ret;
+    uint64_t q;
+    uint32_t wait_n, sc_n, i;
+    if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+    fd = amphora_sc_connect();
+    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    q = (uint64_t)(UINT_PTR)queue;
+    wait_n = info->waitSemaphoreCount;
+    sc_n = info->swapchainCount;
+    if (wait_n > 8) wait_n = 8;
+    if (sc_n > 4) sc_n = 4;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &q, sizeof(q) ) ||
+        amphora_sc_io_write( fd, &wait_n, sizeof(wait_n) ) ||
+        amphora_sc_io_write( fd, &sc_n, sizeof(sc_n) ))
+    { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+    for (i = 0; i < wait_n; i++)
+    {
+        uint64_t s = (uint64_t)(UINT_PTR)info->pWaitSemaphores[i];
+        if (amphora_sc_io_write( fd, &s, sizeof(s) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+    }
+    for (i = 0; i < sc_n; i++)
+    {
+        uint64_t s = (uint64_t)(UINT_PTR)info->pSwapchains[i];
+        uint32_t idx = info->pImageIndices[i];
+        if (amphora_sc_io_write( fd, &s, sizeof(s) ) || amphora_sc_io_write( fd, &idx, sizeof(idx) ))
+        { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+    }
+    if (amphora_sc_io_read( fd, &ret, sizeof(ret) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+    for (i = 0; i < sc_n; i++)
+    {
+        int32_t rr = 0;
+        if (amphora_sc_io_read( fd, &rr, sizeof(rr) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+        if (info->pResults) info->pResults[i] = (VkResult)rr;
+    }
+    close( fd );
+    return (VkResult)ret;
+}
 
 /**********************************************************************
  *           ANDROID_VulkanInit

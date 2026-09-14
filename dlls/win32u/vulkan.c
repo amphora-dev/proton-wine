@@ -46,6 +46,116 @@ static struct vulkan_funcs vulkan_funcs;
 
 WINE_DECLARE_DEBUG_CHANNEL(fps);
 
+/* knife13: Amphora AHB swapchain — source-path via wineandroid amphora_wine_vk*.
+ * No runtime table/needle/GIPA hooks. */
+static int amphora_wsi_wanted(void)
+{
+    const char *a = getenv( "AMPHORA_WINEANDROID" );
+    return a && a[0] == '1' && a[1] == '\0';
+}
+
+/* wineandroid.so is RTLD_LOCAL — RTLD_DEFAULT cannot see amphora_wine_vk*. */
+static void *amphora_wineandroid_so(void)
+{
+    static void *h;
+    static int tried;
+    if (tried) return h;
+    tried = 1;
+    h = dlopen( "wineandroid.so", RTLD_NOW | RTLD_NOLOAD );
+    if (!h) h = dlopen( "wineandroid.so", RTLD_NOW );
+    if (!h) ERR( "amphora bind: dlopen wineandroid.so failed: %s\n", dlerror() );
+    return h;
+}
+
+
+static pthread_mutex_t g_amphora_pend_lock = PTHREAD_MUTEX_INITIALIZER;
+static VkSemaphore g_amphora_pend_sem;
+static VkFence g_amphora_pend_fence;
+
+__attribute__((visibility("default")))
+void amphora_note_acquire_signal( VkSemaphore host_sem, VkFence host_fence )
+{
+    pthread_mutex_lock( &g_amphora_pend_lock );
+    g_amphora_pend_sem = host_sem;
+    g_amphora_pend_fence = host_fence;
+    pthread_mutex_unlock( &g_amphora_pend_lock );
+}
+
+static void amphora_flush_pending_acquire( struct vulkan_device *device, VkQueue host_queue )
+{
+    VkSubmitInfo si;
+    VkSemaphore sem;
+    VkFence fence;
+    VkResult r;
+    if (!amphora_wsi_wanted() || !device || !device->p_vkQueueSubmit || !host_queue) return;
+    pthread_mutex_lock( &g_amphora_pend_lock );
+    sem = g_amphora_pend_sem;
+    fence = g_amphora_pend_fence;
+    g_amphora_pend_sem = VK_NULL_HANDLE;
+    g_amphora_pend_fence = VK_NULL_HANDLE;
+    pthread_mutex_unlock( &g_amphora_pend_lock );
+    if (!sem && !fence) return;
+    memset( &si, 0, sizeof(si) );
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    if (sem)
+    {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &sem;
+    }
+    r = device->p_vkQueueSubmit( host_queue, 1, &si, fence );
+    ERR( "amphora flush acquire signal res=%d sem=%p fence=%p q=%p\n",
+         (int)r, (void *)(UINT_PTR)sem, (void *)(UINT_PTR)fence, (void *)host_queue );
+}
+
+static VkResult (*g_amphora_acquire_khr)( VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t * );
+
+static VkResult amphora_host_acquire2( VkDevice host_device, const VkAcquireNextImageInfoKHR *info, uint32_t *image_index )
+{
+    if (!info || !g_amphora_acquire_khr) return VK_ERROR_INITIALIZATION_FAILED;
+    return g_amphora_acquire_khr( host_device, info->swapchain, info->timeout,
+                                  info->semaphore, info->fence, image_index );
+}
+
+static void amphora_bind_device_wsi( struct vulkan_device *device, VkPhysicalDevice host_phys )
+{
+    typedef void (*PFN_stash)( VkDevice, VkPhysicalDevice );
+    typedef VkResult (*PFN_create)( VkDevice, const VkSwapchainCreateInfoKHR *, const VkAllocationCallbacks *, VkSwapchainKHR * );
+    typedef void (*PFN_destroy)( VkDevice, VkSwapchainKHR, const VkAllocationCallbacks * );
+    typedef VkResult (*PFN_get_images)( VkDevice, VkSwapchainKHR, uint32_t *, VkImage * );
+    typedef VkResult (*PFN_acquire)( VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t * );
+    typedef VkResult (*PFN_present)( VkQueue, const VkPresentInfoKHR * );
+    void *mod;
+    PFN_stash stash;
+    PFN_create create;
+    PFN_destroy destroy;
+    PFN_get_images get_images;
+    PFN_acquire acquire;
+    PFN_present present;
+    if (!device || !amphora_wsi_wanted()) return;
+    mod = amphora_wineandroid_so();
+    if (!mod) return;
+    stash = (PFN_stash)dlsym( mod, "amphora_wine_vkStashDevice" );
+    create = (PFN_create)dlsym( mod, "amphora_wine_vkCreateSwapchainKHR" );
+    destroy = (PFN_destroy)dlsym( mod, "amphora_wine_vkDestroySwapchainKHR" );
+    get_images = (PFN_get_images)dlsym( mod, "amphora_wine_vkGetSwapchainImagesKHR" );
+    acquire = (PFN_acquire)dlsym( mod, "amphora_wine_vkAcquireNextImageKHR" );
+    present = (PFN_present)dlsym( mod, "amphora_wine_vkQueuePresentKHR" );
+    ERR( "amphora bind WSI mod=%p stash=%p create=%p destroy=%p get=%p acquire=%p present=%p\n",
+         mod, stash, create, destroy, get_images, acquire, present );
+    if (stash) stash( device->host.device, host_phys );
+    if (create) device->p_vkCreateSwapchainKHR = create;
+    if (destroy) device->p_vkDestroySwapchainKHR = destroy;
+    if (get_images) device->p_vkGetSwapchainImagesKHR = get_images;
+    if (acquire) {
+        g_amphora_acquire_khr = acquire;
+        device->p_vkAcquireNextImageKHR = acquire;
+        device->p_vkAcquireNextImage2KHR = amphora_host_acquire2;
+    }
+    if (present) device->p_vkQueuePresentKHR = present;
+}
+
+
+
 static const struct vulkan_driver_funcs *driver_funcs;
 static int fshack_enabled = -1;
 
@@ -848,6 +958,50 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     ALL_VK_DEVICE_EXTS
 #undef USE_VK_EXT
 
+    /* Amphora AHB→VkImage import needs ANDROID external_memory on the host device
+     * so gdpa(vkGetAndroidHardwareBufferPropertiesANDROID) is non-NULL. */
+    if (amphora_wsi_wanted())
+    {
+        static const char *ahb_ext = "VK_ANDROID_external_memory_android_hardware_buffer";
+        static const char *deps[] = {
+            "VK_KHR_external_memory",
+            "VK_KHR_dedicated_allocation",
+            "VK_KHR_get_memory_requirements2",
+        };
+        int have = 0, di;
+        uint32_t n = 0, i;
+        VkExtensionProperties *props = NULL;
+        if (instance->p_vkEnumerateDeviceExtensionProperties)
+        {
+            instance->p_vkEnumerateDeviceExtensionProperties( physical_device->host.physical_device, NULL, &n, NULL );
+            if (n && (props = mem_alloc( pool, n * sizeof(*props) )))
+            {
+                instance->p_vkEnumerateDeviceExtensionProperties( physical_device->host.physical_device, NULL, &n, props );
+                for (i = 0; i < n; i++)
+                    if (!strcmp( props[i].extensionName, ahb_ext )) { have = 1; break; }
+            }
+        }
+        if (have)
+        {
+            extensions[count++] = ahb_ext;
+            for (di = 0; di < (int)(sizeof(deps)/sizeof(deps[0])); di++)
+            {
+                int already = 0;
+                for (i = 0; i < count; i++)
+                    if (extensions[i] && !strcmp( extensions[i], deps[di] )) { already = 1; break; }
+                if (!already)
+                {
+                    for (i = 0; props && i < n; i++)
+                        if (!strcmp( props[i].extensionName, deps[di] ))
+                        { extensions[count++] = deps[di]; break; }
+                }
+            }
+            ERR( "amphora: enabling %s (+deps) for AHB import\n", ahb_ext );
+        }
+        else
+            ERR( "amphora: %s not advertised by ICD — AHB import will fail props=0\n", ahb_ext );
+    }
+
     TRACE( "Enabling %u host device extensions\n", count );
     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
         TRACE( "  - %s\n", debugstr_a(*extension) );
@@ -972,6 +1126,9 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     if (!device->p_##name) TRACE( "Device proc %s not found.\n", #name );
     ALL_VK_DEVICE_FUNCS
 #undef USE_VK_FUNC
+
+    /* knife13: wire Amphora AHB CreateSwapchain (wineandroid amphora_wine_vk*). */
+    amphora_bind_device_wsi( device, physical_device->host.physical_device );
 
     for (i = 0; i < create_info->queueCreateInfoCount; i++) init_device_queues( device, create_info->pQueueCreateInfos + i, client_device );
     instance->p_vkGetPhysicalDeviceQueueFamilyProperties( physical_device->host.physical_device, &props_count, device->queue_props );
@@ -2530,6 +2687,7 @@ static BOOL surface_get_fshack_dpi( struct surface *surface )
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
+    /* knife13: device->p_vkCreateSwapchainKHR may be amphora_wine_vkCreateSwapchainKHR. */
     VkSwapchainPresentScalingCreateInfoEXT scaling = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT};
     struct swapchain *swapchain, *old_swapchain = swapchain_from_handle( create_info->oldSwapchain );
     struct surface *surface = surface_from_handle( create_info->surface );
@@ -2997,6 +3155,46 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pWaitSemaphores = &blit_sema;
     }
 
+    if (amphora_wsi_wanted() && device->p_vkQueueSubmit)
+    {
+        VkSubmitInfo si;
+        VkPipelineStageFlags stages[8];
+        uint32_t n = present_info->waitSemaphoreCount, i;
+        VkFence host_fence = VK_NULL_HANDLE;
+        const VkBaseInStructure *hdr;
+        for (hdr = (const VkBaseInStructure *)present_info->pNext; hdr; hdr = hdr->pNext)
+        {
+            if (hdr->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
+            {
+                const VkSwapchainPresentFenceInfoKHR *fi = (const VkSwapchainPresentFenceInfoKHR *)hdr;
+                /* winevulkan already converted these to HOST fences. */
+                if (fi->pFences && fi->swapchainCount)
+                    host_fence = fi->pFences[0];
+                break;
+            }
+        }
+        if (n > 8) n = 8;
+        for (i = 0; i < n; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        memset( &si, 0, sizeof(si) );
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (n)
+        {
+            si.waitSemaphoreCount = n;
+            si.pWaitSemaphores = present_info->pWaitSemaphores;
+            si.pWaitDstStageMask = stages;
+        }
+        amphora_flush_pending_acquire( device, queue->host.queue );
+        if (n || host_fence)
+        {
+            VkResult pr = device->p_vkQueueSubmit( queue->host.queue, 1, &si, host_fence );
+            ERR( "amphora present wait+fence res=%d waits=%u fence=%p\n",
+                 (int)pr, n, (void *)(UINT_PTR)host_fence );
+        }
+        if (device->p_vkQueueWaitIdle)
+            device->p_vkQueueWaitIdle( queue->host.queue );
+        present_info->waitSemaphoreCount = 0;
+        present_info->pWaitSemaphores = NULL;
+    }
     pthread_mutex_lock( &lock );
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
     pthread_mutex_unlock( &lock );
@@ -3307,6 +3505,7 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
         }
     }
 
+    amphora_flush_pending_acquire( device, queue->host.queue );
     res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
 
 failed:
@@ -3370,6 +3569,7 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
         }
     }
 
+    amphora_flush_pending_acquire( queue->device, queue->host.queue );
     res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
 
 failed:
