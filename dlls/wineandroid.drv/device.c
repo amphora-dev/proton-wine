@@ -1572,13 +1572,6 @@ NTSTATUS android_host_reader( void *arg )
 }
 
 
-static void *amphora_host_reader_pthread( void *arg )
-{
-    (void)arg;
-    android_host_reader( NULL );
-    return NULL;
-}
-
 static NTSTATUS amphora_host_connect(void)
 {
     const char *path;
@@ -1630,27 +1623,6 @@ static NTSTATUS amphora_host_connect(void)
 
     amphora_host_fd = fd;
     amphora_mode = 1;
-
-    /* Pin WCP PE dllmain never CreateThread(host_reader). Start it here so a
-     * sideloaded wineandroid.so alone can consume HOST_SURFACE + SCM_RIGHTS. */
-    {
-        static int reader_started;
-        if (!reader_started)
-        {
-            pthread_t thr;
-            reader_started = 1;
-            if (pthread_create( &thr, NULL, amphora_host_reader_pthread, NULL ))
-            {
-                reader_started = 0;
-                ERR( "amphora host reader pthread_create failed: %s\n", strerror( errno ));
-            }
-            else
-            {
-                pthread_detach( thr );
-                ERR( "amphora host reader pthread started fd=%d\n", fd );
-            }
-        }
-    }
 
     TRACE( "amphora connected to %s fd %d\n", path, fd );
     return STATUS_SUCCESS;
