@@ -1,7 +1,7 @@
 MODULE    = wineandroid.drv
 UNIXLIB   = wineandroid.so
 IMPORTS   = ntoskrnl win32u
-UNIX_LIBS = -lwin32u -llog $(PTHREAD_LIBS)
+UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 
 # Amphora hosts the Activity itself. Do not build Wine's wine-debug.apk
 # (EXTRA_TARGETS + gradle); that target is unused and breaks headless WCP CI.
