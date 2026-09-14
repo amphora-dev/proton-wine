@@ -111,6 +111,8 @@ extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
                                       const struct window_rects *new_rects, struct window_surface *surface );
 extern ANativeWindow *get_client_window( HWND hwnd );
 extern BOOL has_client_surface( HWND hwnd );
+extern void android_set_vulkan_direct( HWND hwnd, BOOL enable );
+extern BOOL android_is_vulkan_direct( HWND hwnd );
 
 /* unixlib interface */
 

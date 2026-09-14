@@ -152,6 +152,13 @@ static void CALLBACK register_window_callback( ULONG_PTR arg1, ULONG_PTR arg2, U
 
     ERR( "amphora register_window PE-enter hwnd=%p opengl=%lu\n", hwnd, (unsigned long)arg3 );
     ANDROID_CALL( register_window, &params );
+    /* Client/opengl ANW is Vulkan-DIRECT: keep GDI connect on the parent, but do
+     * not erase/paint/flush GDI onto that hwnd or DXVK pixels are covered. */
+    if (arg3)
+    {
+        ERR( "amphora register_window skip GDI expose/erase hwnd=%p opengl=1\n", hwnd );
+        return;
+    }
     /* PostMessage REFRESH never reaches ANDROID_WindowMessage. Call Expose directly
      * (same effect as WM_ANDROID_REFRESH GDI path) so flush hits parent ANW once. */
     /* Equivalent of WM_ANDROID_REFRESH GDI path without Post/Send (deadlocks device thread).

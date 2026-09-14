@@ -129,6 +129,7 @@ static void android_vulkan_client_surface_destroy( struct client_surface *client
     struct android_vulkan_surface *surface = impl_from_client_surface( client );
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
+    android_set_vulkan_direct( client->hwnd, FALSE );
     if (!surface->window) return;
     if (surface->amphora_parent)
         surface->window->common.decRef( &surface->window->common );
@@ -182,8 +183,11 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
      * (opengl=0) that desktop/winefile LOCK — that ANW is NATIVE_WINDOW_IN_USE. */
     if (amphora && amphora[0] == '1' && amphora[1] == '\0')
     {
-        struct ANativeWindow *tmp = create_ioctl_window( hwnd, TRUE, 1.0f );
+        struct ANativeWindow *tmp;
         int i;
+        /* Mark before CREATE_WINDOW so GDI expose/erase on client bind is skipped. */
+        android_set_vulkan_direct( hwnd, TRUE );
+        tmp = create_ioctl_window( hwnd, TRUE, 1.0f );
         /* Keep the ioctl wrapper alive: last-ref release sends DESTROY_WINDOW. */
         if (!tmp)
             ERR( "amphora vulkan hwnd=%p create_ioctl_window(client) failed\n", hwnd );

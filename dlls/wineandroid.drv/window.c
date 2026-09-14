@@ -56,6 +56,7 @@ struct android_win_data
     ANativeWindow *window;         /* native window wrapper that forwards calls to the desktop process */
     ANativeWindow *client;         /* native client surface wrapper that forwards calls to the desktop process */
     BOOL           has_surface;    /* whether the client surface has been created on the Java side */
+    BOOL           vulkan_direct;  /* client ANW is Vulkan-DIRECT; skip GDI LOCK/paint */
 };
 
 #define SWP_AGG_NOPOSCHANGE (SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER)
@@ -617,6 +618,14 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
      * sock from the device process when this client has no local parent (winefile). */
     if (amphora && amphora[0] == '1')
     {
+        /* Vulkan-DIRECT owns the client ANW. Keep GDI CPU connect on the parent;
+         * do not LOCK/paint/post or DXVK pixels are replaced by GDI white. */
+        if (android_is_vulkan_direct( window_surface->hwnd ))
+        {
+            ERR( "amphora surface_flush skip vulkan-DIRECT hwnd=%p dirty=(%d,%d)-(%d,%d)\n",
+                 window_surface->hwnd, dirty->left, dirty->top, dirty->right, dirty->bottom );
+            return TRUE;
+        }
         ANativeWindow *parent = get_amphora_parent_window( window_surface->hwnd );
         if (!parent)
         {
@@ -1105,7 +1114,8 @@ BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_r
     /* Amphora: Invalidate-after-bind can race a recreating CreateWindowSurface that
      * wipes dirty; Expose the new surface without size-changing Redraw/Invalidate. */
     amphora = getenv( "AMPHORA_WINEANDROID" );
-    if (amphora && amphora[0] == '1' && amphora[1] == '\0' && !expose_in_progress)
+    if (amphora && amphora[0] == '1' && amphora[1] == '\0' && !expose_in_progress
+        && !android_is_vulkan_direct( hwnd ))
     {
         expose_in_progress = 1;
         ERR( "amphora CreateWindowSurface expose hwnd=%p rect=%s\n",
@@ -1265,6 +1275,10 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
             detach_client_surfaces( hwnd );
         }
+        else if (android_is_vulkan_direct( hwnd ))
+        {
+            ERR( "amphora WM_ANDROID_REFRESH skip GDI erase vulkan-DIRECT hwnd=%p\n", hwnd );
+        }
         else
         {
             BOOL exposed, redrawn;
@@ -1308,6 +1322,31 @@ BOOL has_client_surface( HWND hwnd )
     ret = data->has_surface;
     release_win_data( data );
 
+    return ret;
+}
+
+void android_set_vulkan_direct( HWND hwnd, BOOL enable )
+{
+    struct android_win_data *data;
+
+    if (!(data = get_win_data( hwnd )))
+    {
+        ERR( "amphora vulkan-DIRECT mark skipped hwnd=%p enable=%d (no win_data)\n", hwnd, enable );
+        return;
+    }
+    data->vulkan_direct = enable;
+    ERR( "amphora vulkan-DIRECT hwnd=%p enable=%d\n", hwnd, enable );
+    release_win_data( data );
+}
+
+BOOL android_is_vulkan_direct( HWND hwnd )
+{
+    struct android_win_data *data;
+    BOOL ret;
+
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    ret = data->vulkan_direct;
+    release_win_data( data );
     return ret;
 }
 
