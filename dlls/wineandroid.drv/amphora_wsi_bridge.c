@@ -403,16 +403,19 @@ static int win_perform(struct ANativeWindow *window, int operation, ...)
     int32_t cmd = AMPHORA_BUF_PERFORM, op = operation, nargs = 0, args[4], ret;
     va_list ap;
     /* AOSP NATIVE_WINDOW_GET_CONSUMER_USAGE64 / SET_USAGE64 — out/in uint64 cannot
-     * ride the int32 sock protocol; satisfy locally so pastel/libvulkan can create
-     * an Android surface on this sock-proxy hwnd ANW (SurfaceView consumer 0x900). */
+     * ride the int32 sock protocol; satisfy locally so libvulkan can create an
+     * Android surface on this sock-proxy hwnd ANW (Adreno needs 0xB00). */
     enum { NW_SET_USAGE64 = 30, NW_GET_CONSUMER_USAGE64 = 31,
            NW_SET_SHARED_BUFFER_MODE = 21, NW_SET_AUTO_REFRESH = 22 };
     va_start(ap, operation);
     if (operation == NW_GET_CONSUMER_USAGE64) {
         uint64_t *out = va_arg(ap, uint64_t *);
         va_end(ap);
-        if (out) *out = 0x900ull; /* GPU_SAMPLED | COMPOSER_OVERLAY (blit-era usage) */
-        LOGI("perform GET_CONSUMER_USAGE64 -> 0x900 (local stub)");
+        /* Adreno CreateSwapchain needs GPU_FRAMEBUFFER in the combined usage.
+         * Stub consumer as SAMPLED|FRAMEBUFFER|COMPOSER_OVERLAY so SET_USAGE64
+         * is 0xB00 even if GetSwapchainGrallocUsage* is weak/missing. */
+        if (out) *out = 0xB00ull; /* GPU_SAMPLED|GPU_FRAMEBUFFER|COMPOSER_OVERLAY */
+        LOGI("perform GET_CONSUMER_USAGE64 -> 0xB00 (local stub)");
         return 0;
     }
     if (operation == NW_SET_USAGE64) {
