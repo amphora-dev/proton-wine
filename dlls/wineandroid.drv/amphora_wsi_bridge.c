@@ -16,6 +16,10 @@
  * VK_ANDROID_external_memory_android_hardware_buffer (Winlator vk_image
  * route). No GraphicBuffer/VkLayer/runtime hooks. Wine CreateSwapchain calls amphora_ahb_sc_*.
  */
+#if 0
+#pragma makedep unix
+#endif
+
 #include <android/log.h>
 #include <dlfcn.h>
 #include <errno.h>
