@@ -1,6 +1,6 @@
 MODULE    = wineandroid.drv
 UNIXLIB   = wineandroid.so
-IMPORTS   = ntoskrnl
+IMPORTS   = ntoskrnl win32u
 UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 
 # Amphora hosts the Activity itself. Do not build Wine's wine-debug.apk
@@ -11,5 +11,6 @@ SOURCES = \
 	init.c \
 	keyboard.c \
 	opengl.c \
+	vulkan.c \
 	window.c \
 	wine.svg

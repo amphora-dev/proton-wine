@@ -78,6 +78,13 @@ extern UINT ANDROID_OpenGLInit( UINT version, const struct opengl_funcs *opengl_
 
 
 /**************************************************************************
+ * Vulkan driver
+ */
+
+extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs );
+
+
+/**************************************************************************
  * Android pseudo-device
  */
 
@@ -118,6 +125,15 @@ extern BOOL ANDROID_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, c
 extern BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface );
 extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                       const struct window_rects *new_rects, struct window_surface *surface );
+
+/* Amphora AHB/DXVK helpers — tip-final-state vulkan.c needs these.
+ * Full amphora_parent_window host history stays on knife tip; stubs/minimal
+ * implementations live in device.c / window.c until a later port. */
+extern struct ANativeWindow *get_amphora_client_window( HWND hwnd );
+extern struct ANativeWindow *get_amphora_parent_window( HWND hwnd );
+extern int amphora_native_window_sock( struct ANativeWindow *window );
+extern void android_set_vulkan_direct( HWND hwnd, BOOL enable );
+extern BOOL android_is_vulkan_direct( HWND hwnd );
 extern ANativeWindow *get_client_window( HWND hwnd );
 extern BOOL has_client_surface( HWND hwnd );
 

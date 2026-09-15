@@ -1481,6 +1481,33 @@ int ioctl_set_cursor( int id, int width, int height,
     return ret;
 }
 
+
+/***********************************************************************
+ * Amphora AHB/DXVK helpers (minimal — tip-final-state vulkan.c compile/link)
+ *
+ * Knife tip 1c62dd9a8ba carries a large amphora_parent_window / host-sock
+ * implementation in device.c. This subset intentionally does NOT wholesale
+ * replace device.c; surface creation falls back to ioctl client ANW when
+ * these return NULL/-1. Full parent ANW host path can be ported later.
+ */
+struct ANativeWindow *get_amphora_parent_window( HWND hwnd )
+{
+    TRACE( "hwnd %p (stub — Amphora parent ANW not ported on this branch)\n", hwnd );
+    return NULL;
+}
+
+struct ANativeWindow *get_amphora_client_window( HWND hwnd )
+{
+    TRACE( "hwnd %p (stub — Amphora client ANW not ported on this branch)\n", hwnd );
+    return NULL;
+}
+
+int amphora_native_window_sock( struct ANativeWindow *window )
+{
+    TRACE( "window %p (stub)\n", window );
+    return -1;
+}
+
 /**********************************************************************
  *           ANDROID_SetDesktopWindow
  */

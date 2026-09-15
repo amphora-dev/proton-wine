@@ -56,6 +56,7 @@ struct android_win_data
     ANativeWindow *window;         /* native window wrapper that forwards calls to the desktop process */
     ANativeWindow *client;         /* native client surface wrapper that forwards calls to the desktop process */
     BOOL           has_surface;    /* whether the client surface has been created on the Java side */
+    BOOL           vulkan_direct;  /* client ANW is Vulkan-DIRECT; skip GDI LOCK/paint when set */
 };
 
 #define SWP_AGG_NOPOSCHANGE (SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER)
@@ -1202,6 +1203,39 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
         return 0;
     }
+}
+
+
+/***********************************************************************
+ *           android_set_vulkan_direct / android_is_vulkan_direct
+ *
+ * Tip vulkan.c marks hwnd before CREATE_WINDOW so GDI expose/erase on the
+ * dedicated client ANW can be skipped. Full Amphora surface_flush skip
+ * path still needs get_amphora_parent_window (stubbed for now).
+ */
+void android_set_vulkan_direct( HWND hwnd, BOOL enable )
+{
+    struct android_win_data *data;
+
+    if (!(data = get_win_data( hwnd )))
+    {
+        WARN( "vulkan-DIRECT mark skipped hwnd=%p enable=%d (no win_data)\n", hwnd, enable );
+        return;
+    }
+    data->vulkan_direct = enable;
+    TRACE( "hwnd=%p enable=%d\n", hwnd, enable );
+    release_win_data( data );
+}
+
+BOOL android_is_vulkan_direct( HWND hwnd )
+{
+    struct android_win_data *data;
+    BOOL enable = FALSE;
+
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    enable = data->vulkan_direct;
+    release_win_data( data );
+    return enable;
 }
 
 ANativeWindow *get_client_window( HWND hwnd )
