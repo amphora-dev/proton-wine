@@ -427,3 +427,22 @@ jint JNI_OnLoad( JavaVM *vm, void *reserved )
     (*env)->DeleteLocalRef( env, class );
     return JNI_VERSION_1_6;
 }
+
+/* Proton ntdll only dlsyms __wine_unix_call_funcs (no upstream __wine_unix_lib_init
+ * auto-call). Index 0 is invoked from DllMain via WINE_UNIX_CALL(0). */
+static NTSTATUS androiddrv_unix_init( void *args )
+{
+    return __wine_unix_lib_init();
+}
+
+const unixlib_entry_t __wine_unix_call_funcs[] =
+{
+    androiddrv_unix_init,
+};
+
+#ifdef _WIN64
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    androiddrv_unix_init,
+};
+#endif /* _WIN64 */
