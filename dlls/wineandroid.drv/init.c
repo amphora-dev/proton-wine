@@ -362,6 +362,15 @@ DECL_FUNCPTR( ALooper_addFd );
 DECL_FUNCPTR( ALooper_removeFd );
 DECL_FUNCPTR( ALooper_release );
 
+/* Box64 on Amphora may wrap libandroid but not liblog; logging is optional. */
+static int stub_android_log_print( int prio, const char *tag, const char *fmt, ... )
+{
+    (void)prio;
+    (void)tag;
+    (void)fmt;
+    return 0;
+}
+
 static void load_android_libs(void)
 {
     void *libandroid, *liblog;
@@ -374,11 +383,11 @@ static void load_android_libs(void)
     }
     if (!(liblog = dlopen( "liblog.so", RTLD_GLOBAL )))
     {
-        ERR( "failed to load liblog.so: %s\n", dlerror() );
-        abort();
-        return;
+        ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
+        p__android_log_print = stub_android_log_print;
     }
-    LOAD_FUNCPTR( liblog, __android_log_print );
+    else
+        LOAD_FUNCPTR( liblog, __android_log_print );
     LOAD_FUNCPTR( libandroid, ANativeWindow_fromSurface );
     LOAD_FUNCPTR( libandroid, ANativeWindow_release );
     LOAD_FUNCPTR( libandroid, AHardwareBuffer_describe );
