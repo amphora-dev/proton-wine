@@ -635,6 +635,20 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
                 apply_line_region( dst, width, locked.left, y, rgn_rect, end );
             }
 
+            /* Wine DIB is BGRA; Amphora Surface stays PF_RGBA_8888 (SF rejects
+             * fmt=5 / BGRA — HA262AAH full-system crash). Swap R↔B on copy. */
+            {
+                const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+                if (amphora && amphora[0] == '1')
+                {
+                    for (x = 0; x < width; x++)
+                    {
+                        DWORD c = dst[x];
+                        dst[x] = (c & 0xff00ff00) | ((c & 0x00ff0000) >> 16) | ((c & 0x000000ff) << 16);
+                    }
+                }
+            }
+
             src += color_info->bmiHeader.biWidth;
             dst += buffer.stride;
         }
