@@ -137,7 +137,14 @@ struct native_win_wrapper
     HWND                          hwnd;
     BOOL                          opengl;
     LONG                          ref;
+    int                           amphora_sock;
 };
+
+/* Amphora's Vulkan bridge consumes the knife-tip per-window stream protocol,
+ * while proton_11.0 uses the upstream SEQPACKET device transport.  Keep the
+ * latter as the source of truth and expose a tiny stream adapter per wrapper. */
+static struct native_win_wrapper *amphora_windows[65536];
+static pthread_mutex_t amphora_windows_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define IPC_SOCKET_NAME "\0\\Device\\WineAndroid"
 #define IPC_SOCKET_ADDR_LEN ((socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(IPC_SOCKET_NAME) - 1))
@@ -1358,6 +1365,214 @@ static int perform( ANativeWindow *window, int operation, ... )
     return android_ioctl( IOCTL_PERFORM, &perf, sizeof(perf), NULL, NULL, NULL );
 }
 
+
+#define AMPHORA_BUF_DEQUEUE  1
+#define AMPHORA_BUF_QUEUE    2
+#define AMPHORA_BUF_CANCEL   3
+#define AMPHORA_BUF_QUERY    4
+#define AMPHORA_BUF_PERFORM  5
+#define AMPHORA_BUF_SET_SWAP 6
+#define AMPHORA_AHB_NUMFDS  -1
+
+struct amphora_adapter
+{
+    struct native_win_wrapper *win;
+    int sock;
+};
+
+static int amphora_write_full( int fd, const void *buf, size_t len )
+{
+    const char *ptr = buf;
+
+    while (len)
+    {
+        ssize_t ret = write( fd, ptr, len );
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!ret) return -1;
+        ptr += ret;
+        len -= ret;
+    }
+    return 0;
+}
+
+static int amphora_read_full( int fd, void *buf, size_t len )
+{
+    char *ptr = buf;
+
+    while (len)
+    {
+        ssize_t ret = read( fd, ptr, len );
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!ret) return -1;
+        ptr += ret;
+        len -= ret;
+    }
+    return 0;
+}
+
+static int amphora_adapter_dequeue( struct amphora_adapter *adapter )
+{
+    struct native_win_wrapper *win = adapter->win;
+    struct ANativeWindowBuffer *buffer = NULL;
+    AHardwareBuffer_Desc desc = {0};
+    AHardwareBuffer *ahb;
+    int fence = -1, id = -1, generation = 0;
+    struct
+    {
+        int32_t status;
+        int32_t width, height, stride, format, usage;
+        int32_t buffer_id, generation;
+        int32_t numFds, numInts;
+    } reply = {0};
+
+    reply.status = dequeueBuffer( &win->win, &buffer, &fence );
+    wait_fence_and_close( fence );
+    if (!reply.status)
+    {
+        ahb = ahb_from_anwb( win, buffer, &id, &generation );
+        if (!ahb)
+            reply.status = -EINVAL;
+        else
+        {
+            pAHardwareBuffer_describe( ahb, &desc );
+            reply.width = desc.width;
+            reply.height = desc.height;
+            reply.stride = desc.stride;
+            reply.format = desc.format;
+            reply.usage = desc.usage;
+            reply.buffer_id = id;
+            reply.generation = generation;
+            /* The tip WSI bridge recognizes -1 as an AHardwareBuffer handle
+             * serialized immediately after this fixed-size reply. */
+            reply.numFds = AMPHORA_AHB_NUMFDS;
+        }
+    }
+
+    if (amphora_write_full( adapter->sock, &reply, sizeof(reply) )) return -1;
+    if (!reply.status && pAHardwareBuffer_sendHandleToUnixSocket( ahb, adapter->sock )) return -1;
+    return 0;
+}
+
+static int amphora_adapter_queue( struct amphora_adapter *adapter, BOOL cancel )
+{
+    struct native_win_wrapper *win = adapter->win;
+    int32_t id, generation, ret;
+    struct ANativeWindowBuffer *buffer;
+
+    if (amphora_read_full( adapter->sock, &id, sizeof(id) ) ||
+        amphora_read_full( adapter->sock, &generation, sizeof(generation) )) return -1;
+    if (id < 0 || id >= NB_CACHED_BUFFERS || !win->buffers[id].self ||
+        win->buffers[id].generation != generation)
+        ret = -EINVAL;
+    else
+    {
+        buffer = anwb_from_ahb( win->buffers[id].self );
+        ret = cancel ? cancelBuffer( &win->win, buffer, -1 )
+                     : queueBuffer( &win->win, buffer, -1 );
+    }
+    return amphora_write_full( adapter->sock, &ret, sizeof(ret) );
+}
+
+static int amphora_adapter_query( struct amphora_adapter *adapter )
+{
+    int32_t what, ret, value = 0;
+
+    if (amphora_read_full( adapter->sock, &what, sizeof(what) )) return -1;
+    ret = query( &adapter->win->win, what, &value );
+    if (amphora_write_full( adapter->sock, &ret, sizeof(ret) ) ||
+        amphora_write_full( adapter->sock, &value, sizeof(value) )) return -1;
+    return 0;
+}
+
+static int amphora_adapter_perform( struct amphora_adapter *adapter )
+{
+    struct ioctl_android_perform perf = {0};
+    int32_t nargs, ret;
+
+    perf.hdr.hwnd = HandleToLong( adapter->win->hwnd );
+    perf.hdr.opengl = adapter->win->opengl;
+    if (amphora_read_full( adapter->sock, &perf.operation, sizeof(perf.operation) ) ||
+        amphora_read_full( adapter->sock, &nargs, sizeof(nargs) )) return -1;
+    if (nargs < 0 || nargs > ARRAY_SIZE(perf.args)) return -1;
+    if (nargs && amphora_read_full( adapter->sock, perf.args, nargs * sizeof(perf.args[0]) )) return -1;
+    ret = android_ioctl( IOCTL_PERFORM, &perf, sizeof(perf), NULL, NULL, NULL );
+    return amphora_write_full( adapter->sock, &ret, sizeof(ret) );
+}
+
+static void *amphora_adapter_thread( void *arg )
+{
+    struct amphora_adapter *adapter = arg;
+    int32_t command, value, ret;
+
+    while (!amphora_read_full( adapter->sock, &command, sizeof(command) ))
+    {
+        switch (command)
+        {
+        case AMPHORA_BUF_DEQUEUE:
+            if (amphora_adapter_dequeue( adapter )) goto done;
+            break;
+        case AMPHORA_BUF_QUEUE:
+            if (amphora_adapter_queue( adapter, FALSE )) goto done;
+            break;
+        case AMPHORA_BUF_CANCEL:
+            if (amphora_adapter_queue( adapter, TRUE )) goto done;
+            break;
+        case AMPHORA_BUF_QUERY:
+            if (amphora_adapter_query( adapter )) goto done;
+            break;
+        case AMPHORA_BUF_PERFORM:
+            if (amphora_adapter_perform( adapter )) goto done;
+            break;
+        case AMPHORA_BUF_SET_SWAP:
+            if (amphora_read_full( adapter->sock, &value, sizeof(value) )) goto done;
+            ret = setSwapInterval( &adapter->win->win, value );
+            if (amphora_write_full( adapter->sock, &ret, sizeof(ret) )) goto done;
+            break;
+        default:
+            WARN( "unknown Amphora buffer command %d for hwnd %p\n", command, adapter->win->hwnd );
+            goto done;
+        }
+    }
+done:
+    close( adapter->sock );
+    free( adapter );
+    return NULL;
+}
+
+static int create_amphora_adapter( struct native_win_wrapper *win )
+{
+    struct amphora_adapter *adapter;
+    pthread_t thread;
+    int socks[2];
+
+    if (socketpair( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socks )) return -1;
+    if (!(adapter = malloc( sizeof(*adapter) )))
+    {
+        close( socks[0] );
+        close( socks[1] );
+        return -1;
+    }
+    adapter->win = win;
+    adapter->sock = socks[1];
+    if (pthread_create( &thread, NULL, amphora_adapter_thread, adapter ))
+    {
+        close( socks[0] );
+        close( socks[1] );
+        free( adapter );
+        return -1;
+    }
+    pthread_detach( thread );
+    return socks[0];
+}
+
 struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl )
 {
     struct ioctl_android_create_window req;
@@ -1382,6 +1597,7 @@ struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl )
     win->ref  = 1;
     win->hwnd = hwnd;
     win->opengl = opengl;
+    win->amphora_sock = -1;
     TRACE( "-> %p %p opengl=%u\n", win, win->hwnd, opengl );
 
     req.hdr.hwnd = HandleToLong( win->hwnd );
@@ -1390,6 +1606,9 @@ struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl )
     req.is_desktop = hwnd == desktop_window;
     android_ioctl( IOCTL_CREATE_WINDOW, &req, sizeof(req), NULL, NULL, NULL );
 
+    pthread_mutex_lock( &amphora_windows_lock );
+    amphora_windows[data_map_idx( hwnd, opengl )] = win;
+    pthread_mutex_unlock( &amphora_windows_lock );
     return &win->win;
 }
 
@@ -1408,6 +1627,11 @@ void release_ioctl_window( struct ANativeWindow *window )
     if (InterlockedDecrement( &win->ref ) > 0) return;
 
     TRACE( "%p %p\n", win, win->hwnd );
+    pthread_mutex_lock( &amphora_windows_lock );
+    if (amphora_windows[data_map_idx( win->hwnd, win->opengl )] == win)
+        amphora_windows[data_map_idx( win->hwnd, win->opengl )] = NULL;
+    pthread_mutex_unlock( &amphora_windows_lock );
+    if (win->amphora_sock >= 0) close( win->amphora_sock );
     for (i = 0; i < ARRAY_SIZE( win->buffers ); i++)
         if (win->buffers[i].self) pAHardwareBuffer_release(win->buffers[i].self);
 
@@ -1482,30 +1706,41 @@ int ioctl_set_cursor( int id, int width, int height,
 }
 
 
-/***********************************************************************
- * Amphora AHB/DXVK helpers (minimal — tip-final-state vulkan.c compile/link)
- *
- * Knife tip 1c62dd9a8ba carries a large amphora_parent_window / host-sock
- * implementation in device.c. This subset intentionally does NOT wholesale
- * replace device.c; surface creation falls back to ioctl client ANW when
- * these return NULL/-1. Full parent ANW host path can be ported later.
- */
+/* Return only wrappers whose host ANativeWindow is ready.  The Vulkan path
+ * polls this after CREATE_WINDOW, matching the knife-tip register/import wait. */
+static struct ANativeWindow *get_amphora_window( HWND hwnd, BOOL opengl )
+{
+    struct native_win_wrapper *win;
+    int width;
+
+    pthread_mutex_lock( &amphora_windows_lock );
+    win = amphora_windows[data_map_idx( hwnd, opengl )];
+    pthread_mutex_unlock( &amphora_windows_lock );
+    if (!win || query( &win->win, NATIVE_WINDOW_WIDTH, &width )) return NULL;
+    TRACE( "Amphora hwnd %p opengl %u wrapper %p width %d\n", hwnd, opengl, win, width );
+    return &win->win;
+}
+
 struct ANativeWindow *get_amphora_parent_window( HWND hwnd )
 {
-    TRACE( "hwnd %p (stub — Amphora parent ANW not ported on this branch)\n", hwnd );
-    return NULL;
+    return get_amphora_window( hwnd, FALSE );
 }
 
 struct ANativeWindow *get_amphora_client_window( HWND hwnd )
 {
-    TRACE( "hwnd %p (stub — Amphora client ANW not ported on this branch)\n", hwnd );
-    return NULL;
+    return get_amphora_window( hwnd, TRUE );
 }
 
 int amphora_native_window_sock( struct ANativeWindow *window )
 {
-    TRACE( "window %p (stub)\n", window );
-    return -1;
+    struct native_win_wrapper *win = (struct native_win_wrapper *)window;
+
+    if (!window || window->dequeueBuffer != dequeueBuffer || window->perform != perform) return -1;
+    pthread_mutex_lock( &amphora_windows_lock );
+    if (win->amphora_sock < 0) win->amphora_sock = create_amphora_adapter( win );
+    pthread_mutex_unlock( &amphora_windows_lock );
+    TRACE( "Amphora hwnd %p opengl %u stream sock %d\n", win->hwnd, win->opengl, win->amphora_sock );
+    return win->amphora_sock;
 }
 
 /**********************************************************************
