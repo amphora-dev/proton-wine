@@ -31,5 +31,6 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
 
     DisableThreadLibraryCalls( inst );
-    return !__wine_init_unix_call();
+    if (__wine_init_unix_call()) return FALSE;
+    return !WINE_UNIX_CALL( 0, NULL );
 }
