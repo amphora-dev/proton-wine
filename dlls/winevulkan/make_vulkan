@@ -235,6 +235,7 @@ USER_DRIVER_FUNCS = {
     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
     "vkGetPhysicalDeviceSurfaceFormats2KHR",
     "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModesKHR",
     "vkGetPhysicalDeviceWin32PresentationSupportKHR",
     "vkGetSemaphoreWin32HandleKHR",
     "vkGetSwapchainImagesKHR",

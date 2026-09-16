@@ -2124,6 +2124,58 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
                                                                 surface->obj.host.surface, format_count, formats );
 }
 
+
+static VkResult win32u_vkGetPhysicalDeviceSurfacePresentModesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
+                                                                  uint32_t *mode_count, VkPresentModeKHR *modes )
+{
+    /* Android / Adreno often advertise FIFO (and maybe MAILBOX) only. Apps such as
+     * AIO --cube vk default to IMMEDIATE and ERR_EXIT if it is missing. Always
+     * advertise FIFO + MAILBOX + IMMEDIATE (FIFO first); CreateSwapchain remaps
+     * unsupported modes to a host-supported one. */
+    static const VkPresentModeKHR required[] =
+    {
+        VK_PRESENT_MODE_FIFO_KHR,
+        VK_PRESENT_MODE_MAILBOX_KHR,
+        VK_PRESENT_MODE_IMMEDIATE_KHR,
+    };
+    struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
+    struct surface *surface = surface_from_handle( client_surface );
+    struct vulkan_instance *instance = physical_device->instance;
+    VkPresentModeKHR host_modes[16], out[16];
+    uint32_t host_count = ARRAY_SIZE(host_modes), out_count = 0, i, j, copy;
+    VkResult res;
+    VkSurfaceKHR host_surface = surface ? surface->obj.host.surface : 0;
+
+    res = instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR( physical_device->host.physical_device,
+                                                                 host_surface, &host_count, host_modes );
+    if (res < 0) return res;
+    if (host_count > ARRAY_SIZE(host_modes)) host_count = ARRAY_SIZE(host_modes);
+
+    for (i = 0; i < ARRAY_SIZE(required); i++)
+        out[out_count++] = required[i];
+    for (i = 0; i < host_count; i++)
+    {
+        for (j = 0; j < out_count; j++) if (out[j] == host_modes[i]) break;
+        if (j == out_count && out_count < ARRAY_SIZE(out))
+            out[out_count++] = host_modes[i];
+    }
+
+    if (!modes)
+    {
+        *mode_count = out_count;
+        return VK_SUCCESS;
+    }
+    copy = min( *mode_count, out_count );
+    memcpy( modes, out, copy * sizeof(*modes) );
+    if (*mode_count < out_count)
+    {
+        *mode_count = out_count;
+        return VK_INCOMPLETE;
+    }
+    *mode_count = out_count;
+    return VK_SUCCESS;
+}
+
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice client_physical_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
                                                               uint32_t *format_count, VkSurfaceFormat2KHR *formats )
 {
@@ -2708,6 +2760,35 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if (surface) create_info_host.surface = surface->obj.host.surface;
     if (old_swapchain) create_info_host.oldSwapchain = old_swapchain->obj.host.swapchain;
+
+    /* Remap IMMEDIATE/MAILBOX → FIFO when the host ICD does not list them.
+     * Guests may pick IMMEDIATE after we advertise it in PresentModes. */
+    if (create_info_host.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR
+        || create_info_host.presentMode == VK_PRESENT_MODE_MAILBOX_KHR)
+    {
+        VkPresentModeKHR host_modes[16];
+        uint32_t host_count = ARRAY_SIZE(host_modes), i, supported = 0;
+        VkResult pm_res;
+
+        pm_res = instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR( physical_device->host.physical_device,
+                                                                        create_info_host.surface, &host_count, host_modes );
+        if (pm_res >= 0)
+        {
+            if (host_count > ARRAY_SIZE(host_modes)) host_count = ARRAY_SIZE(host_modes);
+            for (i = 0; i < host_count; i++)
+                if (host_modes[i] == create_info_host.presentMode) { supported = 1; break; }
+        }
+        if (!supported)
+        {
+            static int once;
+            if (!once)
+            {
+                once = 1;
+                WARN( "host lacks presentMode %u; remapping to FIFO\n", create_info_host.presentMode );
+            }
+            create_info_host.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        }
+    }
 
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
@@ -4130,6 +4211,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
     .p_vkGetPhysicalDeviceSurfaceFormats2KHR = win32u_vkGetPhysicalDeviceSurfaceFormats2KHR,
     .p_vkGetPhysicalDeviceSurfaceFormatsKHR = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR,
+    .p_vkGetPhysicalDeviceSurfacePresentModesKHR = win32u_vkGetPhysicalDeviceSurfacePresentModesKHR,
     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR,
     .p_vkGetSemaphoreWin32HandleKHR = win32u_vkGetSemaphoreWin32HandleKHR,
     .p_vkGetSwapchainImagesKHR = win32u_vkGetSwapchainImagesKHR,
