@@ -104,6 +104,7 @@ enum android_ioctl
     IOCTL_SET_SWAP_INT,
     IOCTL_SET_CAPTURE,
     IOCTL_SET_CURSOR,
+    IOCTL_GET_BUFFER_SOCK,
     NB_IOCTLS
 };
 
@@ -850,6 +851,15 @@ static int setCursor_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_si
 }
 
 typedef int (*ioctl_func)( JNIEnv* env, void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd );
+/* Amphora host returns wine peer of AMPHORA_BUF socketpair via SCM_RIGHTS.
+ * In-process WineActivity has no separate host serve — not supported here. */
+static int getBufferSock_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+{
+    (void)env; (void)data; (void)in_size; (void)out_size; (void)ret_size;
+    *reply_fd = -1;
+    return -ENOTSUP;
+}
+
 static const ioctl_func ioctl_funcs[] =
 {
     createDesktopView_ioctl,    /* IOCTL_CREATE_DESKTOP_VIEW */
@@ -865,6 +875,7 @@ static const ioctl_func ioctl_funcs[] =
     setSwapInterval_ioctl,      /* IOCTL_SET_SWAP_INT */
     setCapture_ioctl,           /* IOCTL_SET_CAPTURE */
     setCursor_ioctl,            /* IOCTL_SET_CURSOR */
+    getBufferSock_ioctl,        /* IOCTL_GET_BUFFER_SOCK */
 };
 
 static ALooper *looper;
@@ -1756,32 +1767,78 @@ struct ANativeWindow *get_amphora_client_window( HWND hwnd )
     return get_amphora_window( hwnd, TRUE );
 }
 
+/* Fetch tip-model host AMPHORA_BUF wine FD (SCM_RIGHTS) for hwnd+opengl. */
+static int ioctl_get_buffer_sock( HWND hwnd, BOOL opengl, int *out_fd )
+{
+    struct ioctl_header req;
+    int ret, fd = -1;
+
+    if (!out_fd) return -EINVAL;
+    *out_fd = -1;
+    req.hwnd = HandleToLong( hwnd );
+    req.opengl = opengl;
+    ret = android_ioctl( IOCTL_GET_BUFFER_SOCK, &req, sizeof(req), NULL, NULL, &fd );
+    if (ret) return ret;
+    if (fd < 0) return -ENOENT;
+    *out_fd = fd;
+    return 0;
+}
+
 int amphora_native_window_sock( struct ANativeWindow *window )
 {
     struct native_win_wrapper *win = (struct native_win_wrapper *)window;
-    int sock;
+    int sock, i, ret, host_fd = -1;
 
     if (!window || window->dequeueBuffer != dequeueBuffer || window->perform != perform) return -1;
     pthread_mutex_lock( &amphora_windows_lock );
     sock = win->amphora_sock;
     pthread_mutex_unlock( &amphora_windows_lock );
-    /* Do not hold amphora_windows_lock across pthread_create in create_amphora_adapter. */
-    if (sock < 0)
+    if (sock >= 0)
     {
-        sock = create_amphora_adapter( win );
-        pthread_mutex_lock( &amphora_windows_lock );
-        if (win->amphora_sock < 0)
-            win->amphora_sock = sock;
-        else if (sock >= 0)
-        {
-            close( sock );
-            sock = win->amphora_sock;
-        }
-        else
-            sock = win->amphora_sock;
-        pthread_mutex_unlock( &amphora_windows_lock );
+        TRACE( "Amphora hwnd %p opengl %u cached sock %d\n", win->hwnd, win->opengl, sock );
+        return sock;
     }
-    TRACE( "Amphora hwnd %p opengl %u stream sock %d\n", win->hwnd, win->opengl, sock );
+
+    /* Prefer host AMPHORA_BUF sock (tip model). Retry briefly while registerSurface races. */
+    for (i = 0; i < 50; i++)
+    {
+        ret = ioctl_get_buffer_sock( win->hwnd, win->opengl, &host_fd );
+        if (!ret && host_fd >= 0)
+        {
+            pthread_mutex_lock( &amphora_windows_lock );
+            if (win->amphora_sock < 0)
+                win->amphora_sock = host_fd;
+            else
+            {
+                close( host_fd );
+                host_fd = win->amphora_sock;
+            }
+            sock = win->amphora_sock;
+            pthread_mutex_unlock( &amphora_windows_lock );
+            ERR( "amphora hwnd %p opengl %u host AMPHORA_BUF sock %d (ioctl)\n",
+                 win->hwnd, win->opengl, sock );
+            return sock;
+        }
+        if (ret == -ENOTSUP || ret == -EINVAL)
+            break; /* old host without IOCTL_GET_BUFFER_SOCK */
+        if (host_fd >= 0) { close( host_fd ); host_fd = -1; }
+        usleep( 40000 );
+    }
+
+    /* Fallback: local stream adapter that forwards AMPHORA_BUF → ioctl ops. */
+    sock = create_amphora_adapter( win );
+    pthread_mutex_lock( &amphora_windows_lock );
+    if (win->amphora_sock < 0)
+        win->amphora_sock = sock;
+    else if (sock >= 0)
+    {
+        close( sock );
+        sock = win->amphora_sock;
+    }
+    else
+        sock = win->amphora_sock;
+    pthread_mutex_unlock( &amphora_windows_lock );
+    ERR( "amphora hwnd %p opengl %u adapter sock %d (fallback)\n", win->hwnd, win->opengl, sock );
     return sock;
 }
 
