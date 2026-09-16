@@ -138,6 +138,8 @@ struct native_win_wrapper
     BOOL                          opengl;
     LONG                          ref;
     int                           amphora_sock;
+    int                           cached_width;  /* 0 = unset; last successful WIDTH */
+    int                           cached_height; /* 0 = unset; last successful HEIGHT */
 };
 
 /* Amphora's Vulkan bridge consumes the knife-tip per-window stream protocol,
@@ -1222,7 +1224,14 @@ static int query( const ANativeWindow *window, int what, int *value )
     query.what = what;
     ret = android_ioctl( IOCTL_QUERY, &query, sizeof(query), &query, &size, NULL );
     TRACE( "hwnd %p what %d got %d -> %p\n", win->hwnd, what, query.value, value );
-    if (!ret) *value = query.value;
+    if (!ret)
+    {
+        *value = query.value;
+        if (what == NATIVE_WINDOW_WIDTH || what == NATIVE_WINDOW_DEFAULT_WIDTH)
+            win->cached_width = query.value;
+        else if (what == NATIVE_WINDOW_HEIGHT || what == NATIVE_WINDOW_DEFAULT_HEIGHT)
+            win->cached_height = query.value;
+    }
     return ret;
 }
 
@@ -1486,7 +1495,22 @@ static int amphora_adapter_query( struct amphora_adapter *adapter )
     int32_t what, ret, value = 0;
 
     if (amphora_read_full( adapter->sock, &what, sizeof(what) )) return -1;
-    ret = query( &adapter->win->win, what, &value );
+    /* Prefer cached geometry so host win_query (during create) need not wait on
+     * ioctl from this adapter thread; still ioctl if cache missing. */
+    if ((what == NATIVE_WINDOW_WIDTH || what == NATIVE_WINDOW_DEFAULT_WIDTH) &&
+        adapter->win->cached_width > 0)
+    {
+        value = adapter->win->cached_width;
+        ret = 0;
+    }
+    else if ((what == NATIVE_WINDOW_HEIGHT || what == NATIVE_WINDOW_DEFAULT_HEIGHT) &&
+             adapter->win->cached_height > 0)
+    {
+        value = adapter->win->cached_height;
+        ret = 0;
+    }
+    else
+        ret = query( &adapter->win->win, what, &value );
     if (amphora_write_full( adapter->sock, &ret, sizeof(ret) ) ||
         amphora_write_full( adapter->sock, &value, sizeof(value) )) return -1;
     return 0;
@@ -1711,13 +1735,14 @@ int ioctl_set_cursor( int id, int width, int height,
 static struct ANativeWindow *get_amphora_window( HWND hwnd, BOOL opengl )
 {
     struct native_win_wrapper *win;
-    int width;
+    int width, height;
 
     pthread_mutex_lock( &amphora_windows_lock );
     win = amphora_windows[data_map_idx( hwnd, opengl )];
     pthread_mutex_unlock( &amphora_windows_lock );
     if (!win || query( &win->win, NATIVE_WINDOW_WIDTH, &width )) return NULL;
-    TRACE( "Amphora hwnd %p opengl %u wrapper %p width %d\n", hwnd, opengl, win, width );
+    if (query( &win->win, NATIVE_WINDOW_HEIGHT, &height )) return NULL;
+    TRACE( "Amphora hwnd %p opengl %u wrapper %p size %dx%d\n", hwnd, opengl, win, width, height );
     return &win->win;
 }
 
@@ -1734,13 +1759,30 @@ struct ANativeWindow *get_amphora_client_window( HWND hwnd )
 int amphora_native_window_sock( struct ANativeWindow *window )
 {
     struct native_win_wrapper *win = (struct native_win_wrapper *)window;
+    int sock;
 
     if (!window || window->dequeueBuffer != dequeueBuffer || window->perform != perform) return -1;
     pthread_mutex_lock( &amphora_windows_lock );
-    if (win->amphora_sock < 0) win->amphora_sock = create_amphora_adapter( win );
+    sock = win->amphora_sock;
     pthread_mutex_unlock( &amphora_windows_lock );
-    TRACE( "Amphora hwnd %p opengl %u stream sock %d\n", win->hwnd, win->opengl, win->amphora_sock );
-    return win->amphora_sock;
+    /* Do not hold amphora_windows_lock across pthread_create in create_amphora_adapter. */
+    if (sock < 0)
+    {
+        sock = create_amphora_adapter( win );
+        pthread_mutex_lock( &amphora_windows_lock );
+        if (win->amphora_sock < 0)
+            win->amphora_sock = sock;
+        else if (sock >= 0)
+        {
+            close( sock );
+            sock = win->amphora_sock;
+        }
+        else
+            sock = win->amphora_sock;
+        pthread_mutex_unlock( &amphora_windows_lock );
+    }
+    TRACE( "Amphora hwnd %p opengl %u stream sock %d\n", win->hwnd, win->opengl, sock );
+    return sock;
 }
 
 /**********************************************************************

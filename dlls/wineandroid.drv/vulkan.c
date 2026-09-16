@@ -66,19 +66,29 @@ static PFN_android_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
 
 static const struct vulkan_driver_funcs android_vulkan_driver_funcs;
 
-static int amphora_wsi_create_surface( uint64_t vk_instance, int sock, uint64_t *out_surface )
+static int amphora_wsi_create_surface( uint64_t vk_instance, int sock,
+                                        struct ANativeWindow *window, uint64_t *out_surface )
 {
     char path[128];
     struct sockaddr_un addr;
-    int fd = -1, i;
-    int32_t sock32 = sock, reply = -EIO;
+    int fd = -1, i, q;
+    int32_t sock32 = sock, reply = -EIO, width = 640, height = 480;
     uint64_t surface = 0;
 
     if (out_surface) *out_surface = 0;
+
+    /* Query ANW size on the wine thread (ioctl works here) before connecting to
+     * the aarch64 WSI helper — host create must not sock-query the adapter. */
+    if (sock >= 0 && window && window->query)
+    {
+        if (!window->query( window, NATIVE_WINDOW_WIDTH, &q ) && q > 0) width = q;
+        if (!window->query( window, NATIVE_WINDOW_HEIGHT, &q ) && q > 0) height = q;
+    }
+
     snprintf( path, sizeof(path), "/data/user/0/app.amphora/files/wineandroid/wsi-%d.sock",
               (int)getpid() );
-    ERR( "amphora WSI bridge connect %s inst=0x%s sock=%d\n",
-         path, wine_dbgstr_longlong( vk_instance ), sock );
+    ERR( "amphora WSI bridge connect %s inst=0x%s sock=%d size=%dx%d\n",
+         path, wine_dbgstr_longlong( vk_instance ), sock, width, height );
 
     for (i = 0; i < 50; i++)
     {
@@ -99,6 +109,8 @@ static int amphora_wsi_create_surface( uint64_t vk_instance, int sock, uint64_t 
     }
     if (write( fd, &vk_instance, sizeof(vk_instance) ) != (ssize_t)sizeof(vk_instance) ||
         write( fd, &sock32, sizeof(sock32) ) != (ssize_t)sizeof(sock32) ||
+        write( fd, &width, sizeof(width) ) != (ssize_t)sizeof(width) ||
+        write( fd, &height, sizeof(height) ) != (ssize_t)sizeof(height) ||
         read( fd, &reply, sizeof(reply) ) != (ssize_t)sizeof(reply) ||
         read( fd, &surface, sizeof(surface) ) != (ssize_t)sizeof(surface) )
     {
@@ -223,7 +235,7 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
         ERR( "amphora PE WSI bridge hwnd=%p anw=%p sock=%d inst=%p\n",
              hwnd, surface->window, sock, instance->host.instance );
         wret = amphora_wsi_create_surface( (uint64_t)(UINT_PTR)instance->host.instance,
-                                           sock, &host_surface );
+                                           sock, surface->window, &host_surface );
         ERR( "amphora PE WSI bridge hwnd=%p ret=%d surface=0x%s\n",
              hwnd, wret, wine_dbgstr_longlong( host_surface ) );
         if (wret || !host_surface)

@@ -888,7 +888,20 @@ static int win_query(const struct ANativeWindow *window, int what, int *value)
 {
     struct amphora_win *win = (struct amphora_win *)window;
     int32_t cmd = AMPHORA_BUF_QUERY, ret, v, w = what;
-    /* Query what: 0=WIDTH 1=HEIGHT 6=DEFAULT_WIDTH 7=DEFAULT_HEIGHT 8=TRANSFORM_HINT */
+    /* Query what: 0=WIDTH 1=HEIGHT 6=DEFAULT_WIDTH 7=DEFAULT_HEIGHT 8=TRANSFORM_HINT.
+     * If create_android_surface already seeded req_w/req_h, answer geometry without a
+     * sock round-trip — otherwise host blocks in the adapter while guest wine thread
+     * is still waiting on the WSI create-surface reply (deadlock). */
+    if (win->req_w > 0 && (what == 0 /* WIDTH */ || what == 6 /* DEFAULT_WIDTH */)) {
+        LOGI("query what=%d host val=%d override req_w=%d (no sock)", what, win->req_w, win->req_w);
+        if (value) *value = win->req_w;
+        return 0;
+    }
+    if (win->req_h > 0 && (what == 1 /* HEIGHT */ || what == 7 /* DEFAULT_HEIGHT */)) {
+        LOGI("query what=%d host val=%d override req_h=%d (no sock)", what, win->req_h, win->req_h);
+        if (value) *value = win->req_h;
+        return 0;
+    }
     pthread_mutex_lock(&win->lock);
     if (write_full(win->sock, &cmd, sizeof(cmd)) ||
         write_full(win->sock, &w, sizeof(w)) ||
@@ -903,16 +916,6 @@ static int win_query(const struct ANativeWindow *window, int what, int *value)
     if (what == 8) { /* TRANSFORM_HINT */
         LOGI("TRANSFORM_HINT host val=%d -> force IDENTITY 0", v);
         if (value) *value = 0;
-        return 0;
-    }
-    if (win->req_w > 0 && (what == 0 /* WIDTH */ || what == 6 /* DEFAULT_WIDTH */)) {
-        LOGI("query what=%d host val=%d override req_w=%d", what, v, win->req_w);
-        if (value) *value = win->req_w;
-        return 0;
-    }
-    if (win->req_h > 0 && (what == 1 /* HEIGHT */ || what == 7 /* DEFAULT_HEIGHT */)) {
-        LOGI("query what=%d host val=%d override req_h=%d", what, v, win->req_h);
-        if (value) *value = win->req_h;
         return 0;
     }
     if (!ret && value) *value = v;
@@ -1080,11 +1083,16 @@ static struct ANativeWindow *make_win(int sock)
  * intermediate). Host already DEQUEUE/QUEUEs that hwnd Surface; the aarch64 helper
  * only rebuilds a native-ABI ANativeWindow over the same client sock so Box64 can
  * enter vkCreateAndroidSurfaceKHR. */
-int32_t amphora_wsi_create_android_surface(uint64_t vk_instance, int32_t sock_fd, uint64_t *out_surface)
+/* width/height: optional initial size from guest (ioctl on wine thread).
+ * <=0 falls back to 640x480. Seeded onto proxy req_w/req_h so win_query does
+ * not sock-round-trip during vkCreateAndroidSurfaceKHR. */
+int32_t amphora_wsi_create_android_surface(uint64_t vk_instance, int32_t sock_fd,
+                                           int32_t width, int32_t height, uint64_t *out_surface)
 {
     VkInstance inst = (VkInstance)(uintptr_t)vk_instance;
-    int dupfd, w = 640, h = 480, q;
+    int dupfd, w, h;
     struct ANativeWindow *proxy;
+    struct amphora_win *aw;
     void *lib;
     PFN_vkGetInstanceProcAddr gipa;
     PFN_bridge_vkCreateAndroidSurfaceKHR create;
@@ -1098,12 +1106,16 @@ int32_t amphora_wsi_create_android_surface(uint64_t vk_instance, int32_t sock_fd
         LOGE("create_android_surface bad inst=%p sock=%d", (void *)inst, sock_fd);
         return -EINVAL;
     }
+    w = (width > 0) ? width : 640;
+    h = (height > 0) ? height : 480;
     dupfd = dup(sock_fd);
     if (dupfd < 0) { LOGE("dup sock: %s", strerror(errno)); return -errno; }
     proxy = make_win(dupfd);
     if (!proxy) { LOGE("make_win failed"); return -ENOMEM; }
-    if (!proxy->query(proxy, 0, &q) && q > 0) w = q;
-    if (!proxy->query(proxy, 1, &q) && q > 0) h = q;
+    aw = (struct amphora_win *)proxy;
+    aw->req_w = w;
+    aw->req_h = h;
+    LOGI("create_android_surface seed req %dx%d (no sock query)", w, h);
 
     lib = dlopen("libvulkan.so", RTLD_NOW);
     if (!lib) {
@@ -1173,20 +1185,24 @@ static void *wsi_serve(void *arg)
     LOGI("wsi serve pid=%d path=%s", (int)getpid(), path);
     for (;;) {
         uint64_t inst = 0, surface = 0;
-        int32_t sock = -1, ret;
+        int32_t sock = -1, ret, width = 0, height = 0;
         c = accept(ls, NULL, NULL);
         if (c < 0) {
             if (errno == EINTR) continue;
             LOGE("wsi accept: %s", strerror(errno));
             break;
         }
-        if (read_full(c, &inst, sizeof(inst)) || read_full(c, &sock, sizeof(sock))) {
+        /* IPC: inst(u64) + sock(i32) + width(i32) + height(i32).
+         * Old clients that only sent inst+sock would hang here waiting for w/h —
+         * guest wineandroid is changed in lockstep to send the size. */
+        if (read_full(c, &inst, sizeof(inst)) || read_full(c, &sock, sizeof(sock)) ||
+            read_full(c, &width, sizeof(width)) || read_full(c, &height, sizeof(height))) {
             LOGE("wsi read req failed");
             close(c);
             continue;
         }
-        LOGI("wsi req inst=%p sock=%d", (void *)(uintptr_t)inst, sock);
-        ret = amphora_wsi_create_android_surface(inst, sock, &surface);
+        LOGI("wsi req inst=%p sock=%d size=%dx%d", (void *)(uintptr_t)inst, sock, width, height);
+        ret = amphora_wsi_create_android_surface(inst, sock, width, height, &surface);
         if (write_full(c, &ret, sizeof(ret)) || write_full(c, &surface, sizeof(surface)))
             LOGE("wsi write reply failed");
         close(c);
