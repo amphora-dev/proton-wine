@@ -462,12 +462,26 @@ static VkResult amphora_vkCreateSwapchainKHR(
 
     want = pCreateInfo->minImageCount;
     if (want < 2) want = 2;
-    /* Host ANW / ImageReader will not recycle 7 in-flight buffers; ICD smoke
-     * reached frame 50 with ~3. Cap so dequeue after present can return a slot. */
-    if (want > 3) want = 3;
+    /* BLAST SurfaceView: setMaxDequeuedBufferCount rejects count < minUndequeued+1
+     * (HA262 log: requested 3 < minimum 4 when MIN_UNDEQUEUED_BUFFERS=3). Soft-cap
+     * used to be 3 for ImageReader recycle; raise floor to 4, soft-cap to 5. */
+    {
+        int min_undequeued = 0;
+        if (win_query(&win->win, NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &min_undequeued) == 0
+            && min_undequeued > 0) {
+            uint32_t floor = (uint32_t)min_undequeued + 1u;
+            if (want < floor) want = floor;
+        } else if (want < 4) {
+            want = 4;
+        }
+    }
+    if (want > 5) want = 5;
     if (want > AHB_SC_MAX_IMAGES) want = AHB_SC_MAX_IMAGES;
 
-    win_perform(&win->win, NATIVE_WINDOW_SET_BUFFER_COUNT, (int)want);
+    {
+        int set_ret = win_perform(&win->win, NATIVE_WINDOW_SET_BUFFER_COUNT, (int)want);
+        LOGI("AHB_SC SET_BUFFER_COUNT want=%u ret=%d", want, set_ret);
+    }
 
     sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
