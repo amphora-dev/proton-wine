@@ -383,24 +383,52 @@ static void *dlopen_first( const char *const *names )
     return NULL;
 }
 
+/* Box64 emulates dlopen/dlsym for wrapped libs; its handle does not see the
+ * real symbol table of /system libs it only partially wraps. Bypass the
+ * emulation with a direct __loader_dlopen that returns a real namespace
+ * handle whose dlsym sees every exported symbol. */
+static void *(*p__loader_dlopen)( const char *, int, const void * );
+static void *loader_dlopen( const char *path )
+{
+    if (!p__loader_dlopen)
+    {
+        void *ns = dlopen( "libnativeloader.so", RTLD_NOW | RTLD_LOCAL );
+        if (ns) p__loader_dlopen = dlsym( ns, "__loader_dlopen" );
+        if (!p__loader_dlopen)
+        {
+            void *dl = dlopen( "libdl.so", RTLD_NOW | RTLD_LOCAL );
+            if (dl) p__loader_dlopen = dlsym( dl, "__loader_dlopen" );
+        }
+    }
+    if (p__loader_dlopen) return p__loader_dlopen( path, RTLD_GLOBAL, NULL );
+    return NULL;
+}
+
 static void load_android_libs(void)
 {
     void *libandroid, *liblog;
     /* Bare sonames rely on the loader search path, which is empty for a
-     * box64-exec'd guest on some Lineage/QTI devices. Fall back to the
-     * absolute /system paths that exist on every Android device. */
+     * box64-exec'd guest on some Lineage/QTI devices; and box64's emulated
+     * dlsym cannot see symbols of libs it wraps. Prefer the real loader
+     * handle, fall back to absolute /system paths, then the bare soname. */
     static const char *const android_names[] =
-        { "libandroid.so", "/system/lib64/libandroid.so", "/system/lib/libandroid.so", NULL };
+        { "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
     static const char *const log_names[] =
-        { "liblog.so", "/system/lib64/liblog.so", "/system/lib/liblog.so", NULL };
+        { "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
 
-    if (!(libandroid = dlopen_first( android_names )))
+    libandroid = loader_dlopen( android_names[0] );
+    if (!libandroid) libandroid = loader_dlopen( android_names[1] );
+    if (!libandroid) libandroid = dlopen_first( android_names );
+    if (!libandroid)
     {
         ERR( "failed to load libandroid.so: %s\n", dlerror() );
         abort();
         return;
     }
-    if (!(liblog = dlopen_first( log_names )))
+    liblog = loader_dlopen( log_names[0] );
+    if (!liblog) liblog = loader_dlopen( log_names[1] );
+    if (!liblog) liblog = dlopen_first( log_names );
+    if (!liblog)
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
