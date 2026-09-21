@@ -372,17 +372,35 @@ static int stub_android_log_print( int prio, const char *tag, const char *fmt, .
     return 0;
 }
 
+static void *dlopen_first( const char *const *names )
+{
+    void *handle;
+    const char *const *name;
+    for (name = names; *name; name++)
+    {
+        if ((handle = dlopen( *name, RTLD_GLOBAL ))) return handle;
+    }
+    return NULL;
+}
+
 static void load_android_libs(void)
 {
     void *libandroid, *liblog;
+    /* Bare sonames rely on the loader search path, which is empty for a
+     * box64-exec'd guest on some Lineage/QTI devices. Fall back to the
+     * absolute /system paths that exist on every Android device. */
+    static const char *const android_names[] =
+        { "libandroid.so", "/system/lib64/libandroid.so", "/system/lib/libandroid.so", NULL };
+    static const char *const log_names[] =
+        { "liblog.so", "/system/lib64/liblog.so", "/system/lib/liblog.so", NULL };
 
-    if (!(libandroid = dlopen( "libandroid.so", RTLD_GLOBAL )))
+    if (!(libandroid = dlopen_first( android_names )))
     {
         ERR( "failed to load libandroid.so: %s\n", dlerror() );
         abort();
         return;
     }
-    if (!(liblog = dlopen( "liblog.so", RTLD_GLOBAL )))
+    if (!(liblog = dlopen_first( log_names )))
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
