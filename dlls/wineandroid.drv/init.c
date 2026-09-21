@@ -404,52 +404,91 @@ static void *loader_dlopen( const char *path )
     return NULL;
 }
 
+/* Amphora host mode (AMPHORA_WINEANDROID=1) drives windows through the host
+ * IPC bridge — no JNI surface, no ANativeWindow, no AHardwareBuffer. Resolving
+ * those symbols eagerly kills the driver on devices where box64's emulated
+ * dlsym cannot see them. Defer every Android symbol to first use. */
+static void *g_libandroid;
+static void *g_liblog;
+static int g_android_libs_loaded;
+
+static void *android_symbol( void *fallback_lib, const char *name )
+{
+    void *sym;
+    if (fallback_lib && (sym = dlsym( fallback_lib, name ))) return sym;
+    if (g_libandroid && (sym = dlsym( g_libandroid, name ))) return sym;
+    if (g_liblog && (sym = dlsym( g_liblog, name ))) return sym;
+    return dlsym( RTLD_DEFAULT, name );
+}
+
+#define LOAD_FUNCPTR_DEFERRED( func ) \
+    p##func = (typeof(p##func))android_symbol( NULL, #func )
+
+/* Amphora host-mode lazy trampolines: resolve the real symbol on first call,
+ * so the driver registers even when box64's emulated dlsym cannot see it at
+ * load time. Only the surface path (JNI surface_changed) needs fromSurface;
+ * everything else aborts loudly if still missing, same as before. */
+static struct ANativeWindow *lazy_ANativeWindow_fromSurface( JNIEnv *env, jobject surface )
+{
+    typeof(pANativeWindow_fromSurface) f =
+        (typeof(pANativeWindow_fromSurface))android_symbol( g_libandroid, "ANativeWindow_fromSurface" );
+    if (!f) { ERR( "no ANativeWindow_fromSurface at first use\n" ); abort(); }
+    pANativeWindow_fromSurface = f;
+    return f( env, surface );
+}
+#define pANativeWindow_fromSurface lazy_ANativeWindow_fromSurface
+
 static void load_android_libs(void)
 {
-    void *libandroid, *liblog;
     /* Bare sonames rely on the loader search path, which is empty for a
-     * box64-exec'd guest on some Lineage/QTI devices; and box64's emulated
-     * dlsym cannot see symbols of libs it wraps. Prefer the real loader
+     * box64-exec'd guest on some Lineage/QTI devices. Prefer the real loader
      * handle, fall back to absolute /system paths, then the bare soname. */
     static const char *const android_names[] =
         { "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
     static const char *const log_names[] =
         { "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+    BOOL amphora_host = amphora && amphora[0] == '1' && amphora[1] == '\0';
 
-    libandroid = loader_dlopen( android_names[0] );
-    if (!libandroid) libandroid = loader_dlopen( android_names[1] );
-    if (!libandroid) libandroid = dlopen_first( android_names );
-    if (!libandroid)
-    {
+    g_libandroid = loader_dlopen( android_names[0] );
+    if (!g_libandroid) g_libandroid = loader_dlopen( android_names[1] );
+    if (!g_libandroid) g_libandroid = dlopen_first( android_names );
+    g_liblog = loader_dlopen( log_names[0] );
+    if (!g_liblog) g_liblog = loader_dlopen( log_names[1] );
+    if (!g_liblog) g_liblog = dlopen_first( log_names );
+    if (!g_libandroid)
         ERR( "failed to load libandroid.so: %s\n", dlerror() );
-        abort();
-        return;
-    }
-    liblog = loader_dlopen( log_names[0] );
-    if (!liblog) liblog = loader_dlopen( log_names[1] );
-    if (!liblog) liblog = dlopen_first( log_names );
-    if (!liblog)
+    if (!g_liblog)
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
     }
     else
-        LOAD_FUNCPTR( liblog, __android_log_print );
-    LOAD_FUNCPTR( libandroid, ANativeWindow_fromSurface );
-    LOAD_FUNCPTR( libandroid, ANativeWindow_release );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_describe );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_acquire );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_release );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_lock );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_unlock );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_recvHandleFromUnixSocket );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_sendHandleToUnixSocket );
-    LOAD_FUNCPTR( libandroid, ANativeWindowBuffer_getHardwareBuffer );
-    LOAD_FUNCPTR( libandroid, ALooper_acquire );
-    LOAD_FUNCPTR( libandroid, ALooper_forThread );
-    LOAD_FUNCPTR( libandroid, ALooper_addFd );
-    LOAD_FUNCPTR( libandroid, ALooper_removeFd );
-    LOAD_FUNCPTR( libandroid, ALooper_release );
+        LOAD_FUNCPTR_DEFERRED( __android_log_print );
+    if (!p__android_log_print) p__android_log_print = stub_android_log_print;
+    if (amphora_host)
+    {
+        /* Symbols resolve on first use via android_symbol(); the driver must
+         * register even when the wrapped lib hides them today. */
+        g_android_libs_loaded = 1;
+        return;
+    }
+    LOAD_FUNCPTR_DEFERRED( ANativeWindow_fromSurface );
+    LOAD_FUNCPTR_DEFERRED( ANativeWindow_release );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_describe );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_acquire );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_release );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_lock );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_unlock );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_recvHandleFromUnixSocket );
+    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_sendHandleToUnixSocket );
+    LOAD_FUNCPTR_DEFERRED( ANativeWindowBuffer_getHardwareBuffer );
+    LOAD_FUNCPTR_DEFERRED( ALooper_acquire );
+    LOAD_FUNCPTR_DEFERRED( ALooper_forThread );
+    LOAD_FUNCPTR_DEFERRED( ALooper_addFd );
+    LOAD_FUNCPTR_DEFERRED( ALooper_removeFd );
+    LOAD_FUNCPTR_DEFERRED( ALooper_release );
+    g_android_libs_loaded = 1;
 }
 
 #undef DECL_FUNCPTR
