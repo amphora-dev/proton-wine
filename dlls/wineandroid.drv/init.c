@@ -421,14 +421,31 @@ static void *bridge_symbol( const char *name )
 {
     static void *handle;
     static int tried;
-    void *sym;
     if (!tried)
     {
+        const char *preload, *p;
         tried = 1;
-        handle = dlopen( "libamphora_wsi.so", RTLD_NOW );
+        /* Bare-name dlopen cannot see the APK lib dir; LD_PRELOAD carries the
+         * absolute path of the helper (box64's dlsym has no RTLD_DEFAULT). */
+        if ((preload = getenv( "LD_PRELOAD" )))
+        {
+            for (p = preload; *p && !handle; )
+            {
+                const char *end = p + strcspn( p, ": " );
+                char path[4096];
+                size_t len = end - p;
+                if (len && len < sizeof(path))
+                {
+                    memcpy( path, p, len );
+                    path[len] = 0;
+                    handle = dlopen( path, RTLD_NOW );
+                }
+                p = *end ? end + 1 : end;
+            }
+        }
+        if (!handle) handle = dlopen( "libamphora_wsi.so", RTLD_NOW );
     }
-    if (handle && (sym = dlsym( handle, name ))) return sym;
-    return dlsym( RTLD_DEFAULT, name );
+    return handle ? dlsym( handle, name ) : NULL;
 }
 
 #define LOAD_FUNCPTR(lib, func) do { \
@@ -467,21 +484,27 @@ static void load_android_libs(void)
 {
     /* Absolute paths first: the bare soname resolves against the guest's
      * LD_LIBRARY_PATH (imagefs usr/lib) before /system on some setups. */
+    /* lib*-real.so are symlinks published by libamphora_wsi's ctor under names
+     * box64 does not wrap; bare/absolute libandroid.so hits box64's fake
+     * handle. Absolute paths first for plain devices. */
     static const char *const android_names[] =
-        { "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
+        { "libandroid-real.so", "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
     static const char *const log_names[] =
-        { "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
+        { "liblog-real.so", "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
     void *libandroid = NULL, *liblog = NULL;
     const char *const *name;
+    const char *android_src = NULL, *log_src = NULL;
 
-    for (name = android_names; *name && !libandroid; name++) libandroid = real_dlopen( *name );
-    for (name = log_names; *name && !liblog; name++) liblog = real_dlopen( *name );
+    for (name = android_names; *name && !libandroid; name++)
+        if ((libandroid = real_dlopen( *name ))) android_src = *name;
+    for (name = log_names; *name && !liblog; name++)
+        if ((liblog = real_dlopen( *name ))) log_src = *name;
 
     {
         void *probe = bridge_symbol( "ALooper_forThread" );
-        ERR( "load_android_libs: loader=%s bridge=%s libandroid=%s liblog=%s\n", loader_src,
-             probe ? "ok" : "none",
-             libandroid ? "ok" : "FAIL", liblog ? "ok" : "FAIL" );
+        ERR( "load_android_libs: loader=%s bridge=%s android=%s/%s log=%s/%s\n", loader_src,
+             probe ? "ok" : "none", android_src ? android_src : "FAIL", probe ? "via-bridge" : "direct",
+             log_src ? log_src : "FAIL", probe ? "via-bridge" : "direct" );
         if (!libandroid && !probe)
         {
             ERR( "failed to load libandroid.so: %s\n", dlerror() );
