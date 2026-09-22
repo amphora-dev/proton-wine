@@ -408,8 +408,32 @@ static void *real_dlsym( void *handle, const char *name )
 }
 
 #define DECL_FUNCPTR(f) typeof(f) * p##f = NULL
+
+/* Under box64 the unixlib is x86_64: every dlopen/dlsym goes through box64's
+ * wrappers, which hide the NDK symbols behind a fake libandroid handle, and
+ * bionic's private __loader_* entry points are unreachable from x86 code. But
+ * dlopen of a name box64 does not wrap returns a real handle, and dlsym on a
+ * real handle yields callable bridges. libamphora_wsi.so is LD_PRELOAD'd into
+ * the guest and links libandroid/liblog, so its dependency tree carries every
+ * NDK symbol we need — look them up there first (same pattern as the GL probe
+ * in opengl.c). */
+static void *bridge_symbol( const char *name )
+{
+    static void *handle;
+    static int tried;
+    void *sym;
+    if (!tried)
+    {
+        tried = 1;
+        handle = dlopen( "libamphora_wsi.so", RTLD_NOW );
+    }
+    if (handle && (sym = dlsym( handle, name ))) return sym;
+    return dlsym( RTLD_DEFAULT, name );
+}
+
 #define LOAD_FUNCPTR(lib, func) do { \
-    if ((p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
+    if ((p##func = (typeof(p##func))bridge_symbol( #func )) == NULL && \
+        (p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
         { ERR( "can't find symbol %s\n", #func); abort(); return; } \
     } while(0)
 
@@ -453,21 +477,24 @@ static void load_android_libs(void)
     for (name = android_names; *name && !libandroid; name++) libandroid = real_dlopen( *name );
     for (name = log_names; *name && !liblog; name++) liblog = real_dlopen( *name );
 
-    ERR( "load_android_libs: loader=%s libandroid=%s liblog=%s\n", loader_src,
-         libandroid ? "ok" : "FAIL", liblog ? "ok" : "FAIL" );
-    if (!libandroid)
     {
-        ERR( "failed to load libandroid.so: %s\n", dlerror() );
-        abort();
-        return;
+        void *probe = bridge_symbol( "ALooper_forThread" );
+        ERR( "load_android_libs: loader=%s bridge=%s libandroid=%s liblog=%s\n", loader_src,
+             probe ? "ok" : "none",
+             libandroid ? "ok" : "FAIL", liblog ? "ok" : "FAIL" );
+        if (!libandroid && !probe)
+        {
+            ERR( "failed to load libandroid.so: %s\n", dlerror() );
+            abort();
+            return;
+        }
     }
-    if (!liblog)
+    if (!(p__android_log_print = (typeof(p__android_log_print))bridge_symbol( "__android_log_print" )) &&
+        (!liblog || !(p__android_log_print = (typeof(p__android_log_print))real_dlsym( liblog, "__android_log_print" ))))
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
     }
-    else if (!(p__android_log_print = (typeof(p__android_log_print))real_dlsym( liblog, "__android_log_print" )))
-        p__android_log_print = stub_android_log_print;
     LOAD_FUNCPTR( libandroid, ANativeWindow_fromSurface );
     LOAD_FUNCPTR( libandroid, ANativeWindow_release );
     LOAD_FUNCPTR( libandroid, AHardwareBuffer_describe );
