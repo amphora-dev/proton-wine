@@ -340,9 +340,39 @@ static const JNINativeMethod methods[] =
     { "wine_init", "()V", wine_init_jni }
 };
 
+/* box64 intercepts dlopen/dlsym for the libs it wraps (it wraps libandroid.so
+ * for SysV-shm emulation, and its liblog wrap fails outright on some devices),
+ * handing out a fake handle whose symbol table hides ANativeWindow_*,
+ * AHardwareBuffer_* and ALooper_*. The real bionic loader entry points
+ * __loader_dlopen / __loader_dlsym are not in box64's wrap table, so calls
+ * bound at link time against libdl reach the real loader and return real
+ * namespace handles with the full symbol table. Weak imports keep plain
+ * dlopen/dlsym working where those entry points are absent (there the plain
+ * entry points are the real ones anyway). The caller address is forwarded like
+ * libdl's own dlopen wrapper does, so the linker namespace is picked by where
+ * this module lives. */
+extern void *__loader_dlopen( const char *, int, const void * ) __attribute__((weak));
+extern void *__loader_dlsym( void *, const char *, const void * ) __attribute__((weak));
+
+static void *real_dlopen( const char *name )
+{
+    void *handle;
+    if (&__loader_dlopen && (handle = __loader_dlopen( name, RTLD_GLOBAL, __builtin_return_address( 0) )))
+        return handle;
+    return dlopen( name, RTLD_GLOBAL );
+}
+
+static void *real_dlsym( void *handle, const char *name )
+{
+    void *sym;
+    if (&__loader_dlsym && handle && (sym = __loader_dlsym( handle, name, __builtin_return_address( 0) )))
+        return sym;
+    return dlsym( handle, name );
+}
+
 #define DECL_FUNCPTR(f) typeof(f) * p##f = NULL
 #define LOAD_FUNCPTR(lib, func) do { \
-    if ((p##func = dlsym( lib, #func )) == NULL) \
+    if ((p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
         { ERR( "can't find symbol %s\n", #func); abort(); return; } \
     } while(0)
 
@@ -363,7 +393,7 @@ DECL_FUNCPTR( ALooper_addFd );
 DECL_FUNCPTR( ALooper_removeFd );
 DECL_FUNCPTR( ALooper_release );
 
-/* Box64 on Amphora may wrap libandroid but not liblog; logging is optional. */
+/* Logging is optional: some box64 builds cannot load liblog at all. */
 static int stub_android_log_print( int prio, const char *tag, const char *fmt, ... )
 {
     (void)prio;
@@ -372,123 +402,48 @@ static int stub_android_log_print( int prio, const char *tag, const char *fmt, .
     return 0;
 }
 
-static void *dlopen_first( const char *const *names )
-{
-    void *handle;
-    const char *const *name;
-    for (name = names; *name; name++)
-    {
-        if ((handle = dlopen( *name, RTLD_GLOBAL ))) return handle;
-    }
-    return NULL;
-}
-
-/* Box64 emulates dlopen/dlsym for wrapped libs; its handle does not see the
- * real symbol table of /system libs it only partially wraps. Bypass the
- * emulation with a direct __loader_dlopen that returns a real namespace
- * handle whose dlsym sees every exported symbol. */
-static void *(*p__loader_dlopen)( const char *, int, const void * );
-static void *loader_dlopen( const char *path )
-{
-    if (!p__loader_dlopen)
-    {
-        void *ns = dlopen( "libnativeloader.so", RTLD_NOW | RTLD_LOCAL );
-        if (ns) p__loader_dlopen = dlsym( ns, "__loader_dlopen" );
-        if (!p__loader_dlopen)
-        {
-            void *dl = dlopen( "libdl.so", RTLD_NOW | RTLD_LOCAL );
-            if (dl) p__loader_dlopen = dlsym( dl, "__loader_dlopen" );
-        }
-    }
-    if (p__loader_dlopen) return p__loader_dlopen( path, RTLD_GLOBAL, NULL );
-    return NULL;
-}
-
-/* Amphora host mode (AMPHORA_WINEANDROID=1) drives windows through the host
- * IPC bridge — no JNI surface, no ANativeWindow, no AHardwareBuffer. Resolving
- * those symbols eagerly kills the driver on devices where box64's emulated
- * dlsym cannot see them. Defer every Android symbol to first use. */
-static void *g_libandroid;
-static void *g_liblog;
-static int g_android_libs_loaded;
-
-static void *android_symbol( void *fallback_lib, const char *name )
-{
-    void *sym;
-    if (fallback_lib && (sym = dlsym( fallback_lib, name ))) return sym;
-    if (g_libandroid && (sym = dlsym( g_libandroid, name ))) return sym;
-    if (g_liblog && (sym = dlsym( g_liblog, name ))) return sym;
-    return dlsym( RTLD_DEFAULT, name );
-}
-
-#define LOAD_FUNCPTR_DEFERRED( func ) \
-    p##func = (typeof(p##func))android_symbol( NULL, #func )
-
-/* Amphora host-mode lazy trampolines: resolve the real symbol on first call,
- * so the driver registers even when box64's emulated dlsym cannot see it at
- * load time. Only the surface path (JNI surface_changed) needs fromSurface;
- * everything else aborts loudly if still missing, same as before. */
-static struct ANativeWindow *lazy_ANativeWindow_fromSurface( JNIEnv *env, jobject surface )
-{
-    typeof(pANativeWindow_fromSurface) f =
-        (typeof(pANativeWindow_fromSurface))android_symbol( g_libandroid, "ANativeWindow_fromSurface" );
-    if (!f) { ERR( "no ANativeWindow_fromSurface at first use\n" ); abort(); }
-    pANativeWindow_fromSurface = f;
-    return f( env, surface );
-}
-#define pANativeWindow_fromSurface lazy_ANativeWindow_fromSurface
-
 static void load_android_libs(void)
 {
-    /* Bare sonames rely on the loader search path, which is empty for a
-     * box64-exec'd guest on some Lineage/QTI devices. Prefer the real loader
-     * handle, fall back to absolute /system paths, then the bare soname. */
+    /* Absolute paths first: the bare soname resolves against the guest's
+     * LD_LIBRARY_PATH (imagefs usr/lib) before /system on some setups. */
     static const char *const android_names[] =
         { "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
     static const char *const log_names[] =
         { "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
-    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-    BOOL amphora_host = amphora && amphora[0] == '1' && amphora[1] == '\0';
+    void *libandroid = NULL, *liblog = NULL;
+    const char *const *name;
 
-    g_libandroid = loader_dlopen( android_names[0] );
-    if (!g_libandroid) g_libandroid = loader_dlopen( android_names[1] );
-    if (!g_libandroid) g_libandroid = dlopen_first( android_names );
-    g_liblog = loader_dlopen( log_names[0] );
-    if (!g_liblog) g_liblog = loader_dlopen( log_names[1] );
-    if (!g_liblog) g_liblog = dlopen_first( log_names );
-    if (!g_libandroid)
+    for (name = android_names; *name && !libandroid; name++) libandroid = real_dlopen( *name );
+    for (name = log_names; *name && !liblog; name++) liblog = real_dlopen( *name );
+
+    if (!libandroid)
+    {
         ERR( "failed to load libandroid.so: %s\n", dlerror() );
-    if (!g_liblog)
+        abort();
+        return;
+    }
+    if (!liblog)
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
     }
-    else
-        LOAD_FUNCPTR_DEFERRED( __android_log_print );
-    if (!p__android_log_print) p__android_log_print = stub_android_log_print;
-    if (amphora_host)
-    {
-        /* Symbols resolve on first use via android_symbol(); the driver must
-         * register even when the wrapped lib hides them today. */
-        g_android_libs_loaded = 1;
-        return;
-    }
-    LOAD_FUNCPTR_DEFERRED( ANativeWindow_fromSurface );
-    LOAD_FUNCPTR_DEFERRED( ANativeWindow_release );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_describe );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_acquire );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_release );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_lock );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_unlock );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_recvHandleFromUnixSocket );
-    LOAD_FUNCPTR_DEFERRED( AHardwareBuffer_sendHandleToUnixSocket );
-    LOAD_FUNCPTR_DEFERRED( ANativeWindowBuffer_getHardwareBuffer );
-    LOAD_FUNCPTR_DEFERRED( ALooper_acquire );
-    LOAD_FUNCPTR_DEFERRED( ALooper_forThread );
-    LOAD_FUNCPTR_DEFERRED( ALooper_addFd );
-    LOAD_FUNCPTR_DEFERRED( ALooper_removeFd );
-    LOAD_FUNCPTR_DEFERRED( ALooper_release );
-    g_android_libs_loaded = 1;
+    else if (!(p__android_log_print = (typeof(p__android_log_print))real_dlsym( liblog, "__android_log_print" )))
+        p__android_log_print = stub_android_log_print;
+    LOAD_FUNCPTR( libandroid, ANativeWindow_fromSurface );
+    LOAD_FUNCPTR( libandroid, ANativeWindow_release );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_describe );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_acquire );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_release );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_lock );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_unlock );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_recvHandleFromUnixSocket );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_sendHandleToUnixSocket );
+    LOAD_FUNCPTR( libandroid, ANativeWindowBuffer_getHardwareBuffer );
+    LOAD_FUNCPTR( libandroid, ALooper_acquire );
+    LOAD_FUNCPTR( libandroid, ALooper_forThread );
+    LOAD_FUNCPTR( libandroid, ALooper_addFd );
+    LOAD_FUNCPTR( libandroid, ALooper_removeFd );
+    LOAD_FUNCPTR( libandroid, ALooper_release );
 }
 
 #undef DECL_FUNCPTR
