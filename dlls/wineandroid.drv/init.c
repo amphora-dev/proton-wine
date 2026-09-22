@@ -340,32 +340,69 @@ static const JNINativeMethod methods[] =
     { "wine_init", "()V", wine_init_jni }
 };
 
-/* box64 intercepts dlopen/dlsym for the libs it wraps (it wraps libandroid.so
- * for SysV-shm emulation, and its liblog wrap fails outright on some devices),
- * handing out a fake handle whose symbol table hides ANativeWindow_*,
- * AHardwareBuffer_* and ALooper_*. The real bionic loader entry points
- * __loader_dlopen / __loader_dlsym are not in box64's wrap table, so calls
- * bound at link time against libdl reach the real loader and return real
- * namespace handles with the full symbol table. Weak imports keep plain
- * dlopen/dlsym working where those entry points are absent (there the plain
- * entry points are the real ones anyway). The caller address is forwarded like
- * libdl's own dlopen wrapper does, so the linker namespace is picked by where
- * this module lives. */
+/* box64 intercepts dlopen/dlsym for the libs it wraps (libdl.so, libc.so,
+ * libandroid.so — the latter for SysV-shm emulation) and hands out fake
+ * handles whose symbol tables hide ANativeWindow_*, AHardwareBuffer_* and
+ * ALooper_*; plain "liblog.so" fails outright on some devices. __loader_dlopen
+ * / __loader_dlsym are not in box64's wrap table, so calling them directly
+ * reaches the real bionic loader. Their caller address selects the linker
+ * namespace: pass the resolved &dlopen (my_dlopen under box64 = the main
+ * executable, the real dlopen in libdl otherwise) so the lookup lands in the
+ * default namespace, which may open /system libs. Weak refs and a dlsym
+ * bootstrap (box64 passes names it does not wrap through to the real dlsym)
+ * keep non-box64 builds working; plain dlopen/dlsym is the last resort. */
 extern void *__loader_dlopen( const char *, int, const void * ) __attribute__((weak));
 extern void *__loader_dlsym( void *, const char *, const void * ) __attribute__((weak));
+extern void *android_dlopen_ext( const char *, int, const void * ) __attribute__((weak));
+
+typedef void *(*loader_dlopen_t)( const char *, int, const void * );
+typedef void *(*loader_dlsym_t)( void *, const char *, const void * );
+typedef void *(*loader_dext_t)( const char *, int, const void * );
+
+static loader_dlopen_t p_loader_dlopen;
+static loader_dlsym_t p_loader_dlsym;
+static loader_dext_t p_android_dlopen_ext;
+static const char *loader_src;
+
+static void resolve_loader(void)
+{
+    if (loader_src) return;
+    if (&__loader_dlopen)
+    {
+        p_loader_dlopen = &__loader_dlopen;
+        p_loader_dlsym = &__loader_dlsym;
+        loader_src = "weak";
+    }
+    else if (dlsym( RTLD_DEFAULT, "__loader_dlopen" ))
+    {
+        p_loader_dlopen = (loader_dlopen_t)dlsym( RTLD_DEFAULT, "__loader_dlopen" );
+        p_loader_dlsym = (loader_dlsym_t)dlsym( RTLD_DEFAULT, "__loader_dlsym" );
+        loader_src = "dlsym";
+    }
+    else if (&android_dlopen_ext)
+    {
+        p_android_dlopen_ext = &android_dlopen_ext;
+        loader_src = "dlext";
+    }
+    else loader_src = "plain";
+}
 
 static void *real_dlopen( const char *name )
 {
-    void *handle;
-    if (&__loader_dlopen && (handle = __loader_dlopen( name, RTLD_GLOBAL, __builtin_return_address( 0) )))
+    void *handle = NULL;
+    resolve_loader();
+    if (p_loader_dlopen && (handle = p_loader_dlopen( name, RTLD_GLOBAL, (const void *)&dlopen )))
+        return handle;
+    if (p_android_dlopen_ext && (handle = p_android_dlopen_ext( name, RTLD_GLOBAL, NULL )))
         return handle;
     return dlopen( name, RTLD_GLOBAL );
 }
 
 static void *real_dlsym( void *handle, const char *name )
 {
-    void *sym;
-    if (&__loader_dlsym && handle && (sym = __loader_dlsym( handle, name, __builtin_return_address( 0) )))
+    void *sym = NULL;
+    resolve_loader();
+    if (p_loader_dlsym && handle && (sym = p_loader_dlsym( handle, name, (const void *)&dlsym )))
         return sym;
     return dlsym( handle, name );
 }
@@ -416,6 +453,8 @@ static void load_android_libs(void)
     for (name = android_names; *name && !libandroid; name++) libandroid = real_dlopen( *name );
     for (name = log_names; *name && !liblog; name++) liblog = real_dlopen( *name );
 
+    ERR( "load_android_libs: loader=%s libandroid=%s liblog=%s\n", loader_src,
+         libandroid ? "ok" : "FAIL", liblog ? "ok" : "FAIL" );
     if (!libandroid)
     {
         ERR( "failed to load libandroid.so: %s\n", dlerror() );
