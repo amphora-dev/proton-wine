@@ -126,9 +126,8 @@ extern BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *su
 extern void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                       const struct window_rects *new_rects, struct window_surface *surface );
 
-/* Amphora AHB/DXVK helpers — tip-final-state vulkan.c needs these.
- * Full amphora_parent_window host history stays on knife tip; stubs/minimal
- * implementations live in device.c / window.c until a later port. */
+/* Amphora AHB/DXVK helpers — vulkan.c needs these.
+ * Implementations live in device.c / window.c. */
 extern struct ANativeWindow *get_amphora_client_window( HWND hwnd );
 extern struct ANativeWindow *get_amphora_parent_window( HWND hwnd );
 extern int amphora_native_window_sock( struct ANativeWindow *window );

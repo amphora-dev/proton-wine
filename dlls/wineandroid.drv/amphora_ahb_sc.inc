@@ -1,4 +1,4 @@
-/* knife13: AHB-import swapchain (Winlator vk_image route).
+/* AHB-import swapchain (Winlator vk_image route).
  * NOT a VkLayer. No GIPA/Negotiate export. No GraphicBuffer.
  * No runtime wine-table / needle / GIPA / GDPA hooks.
  * Wine CreateSwapchain (wineandroid / win32u) calls amphora_ahb_sc_* at
@@ -460,27 +460,21 @@ static VkResult amphora_vkCreateSwapchainKHR(
         return g_real_CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
     }
 
+    int min_undequeued = 1;
+    if (win_query(&win->win, NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &min_undequeued) != 0 || min_undequeued < 1)
+        min_undequeued = 1;
+
     want = pCreateInfo->minImageCount;
     if (want < 2) want = 2;
-    /* BLAST SurfaceView: setMaxDequeuedBufferCount rejects count < minUndequeued+1
-     * (HA262 log: requested 3 < minimum 4 when MIN_UNDEQUEUED_BUFFERS=3). Soft-cap
-     * used to be 3 for ImageReader recycle; raise floor to 4, soft-cap to 5. */
-    {
-        int min_undequeued = 0;
-        if (win_query(&win->win, NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &min_undequeued) == 0
-            && min_undequeued > 0) {
-            uint32_t floor = (uint32_t)min_undequeued + 1u;
-            if (want < floor) want = floor;
-        } else if (want < 4) {
-            want = 4;
-        }
-    }
-    if (want > 5) want = 5;
-    if (want > AHB_SC_MAX_IMAGES) want = AHB_SC_MAX_IMAGES;
+    if (want > 3) want = 3;
+
+    int total_buffers = (int)want + min_undequeued;
+    if (total_buffers > AHB_SC_MAX_IMAGES) total_buffers = AHB_SC_MAX_IMAGES;
 
     {
-        int set_ret = win_perform(&win->win, NATIVE_WINDOW_SET_BUFFER_COUNT, (int)want);
-        LOGI("AHB_SC SET_BUFFER_COUNT want=%u ret=%d", want, set_ret);
+        int set_ret = win_perform(&win->win, NATIVE_WINDOW_SET_BUFFER_COUNT, total_buffers);
+        LOGI("AHB_SC SET_BUFFER_COUNT want=%u min_undeq=%d total=%d ret=%d",
+             want, min_undequeued, total_buffers, set_ret);
     }
 
     sc = calloc(1, sizeof(*sc));
@@ -720,7 +714,7 @@ static VkResult amphora_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR 
             continue;
         }
         /* Already on host from create — only notify + recycle slot. */
-        amphora_guest_queue_knife(sc->bufs[idx]);
+        amphora_guest_queue_sync(sc->bufs[idx]);
         qret = 0;
         sc->state[idx] = AHB_SC_FREE;
         if (qret != 0) {

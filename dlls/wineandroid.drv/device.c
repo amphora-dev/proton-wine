@@ -143,7 +143,7 @@ struct native_win_wrapper
     int                           cached_height; /* 0 = unset; last successful HEIGHT */
 };
 
-/* Amphora's Vulkan bridge consumes the knife-tip per-window stream protocol,
+/* Amphora's Vulkan bridge consumes the per-window stream protocol,
  * while proton_11.0 uses the upstream SEQPACKET device transport.  Keep the
  * latter as the source of truth and expose a tiny stream adapter per wrapper. */
 static struct native_win_wrapper *amphora_windows[65536];
@@ -1742,7 +1742,7 @@ int ioctl_set_cursor( int id, int width, int height,
 
 
 /* Return only wrappers whose host ANativeWindow is ready.  The Vulkan path
- * polls this after CREATE_WINDOW, matching the knife-tip register/import wait. */
+ * polls this after CREATE_WINDOW, matching the host register/import wait. */
 static struct ANativeWindow *get_amphora_window( HWND hwnd, BOOL opengl )
 {
     struct native_win_wrapper *win;

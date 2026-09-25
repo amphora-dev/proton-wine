@@ -12,7 +12,7 @@
  * hwnd ANW (no ImageReader blit hop) so PE QueuePresent DEQUEUE/QUEUEs the
  * dedicated Amphora window Surface directly.
  *
- * knife13: CreateSwapchain imports sock-proxy AHBs as VkImages via
+ * CreateSwapchain imports sock-proxy AHBs as VkImages via
  * VK_ANDROID_external_memory_android_hardware_buffer (Winlator vk_image
  * route). No GraphicBuffer/VkLayer/runtime hooks. Wine CreateSwapchain calls amphora_ahb_sc_*.
  */
@@ -130,7 +130,7 @@ struct ANativeWindow {
     int (*cancelBuffer)(struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fenceFd);
 };
 
-/* knife12e: AHB-import swapchain owns GPU binding. ANW dequeue only has to
+/* AHB-import swapchain owns GPU binding. ANW dequeue only has to
  * carry the sock-proxy AHB (and a synthetic ANWB so (amphora_buf*)anwb works).
  * Do NOT convert AHB→GraphicBuffer or guess OEM ANWB layout — ICD never
  * dequeues these if AHB_SC CreateSwapchain succeeds. */
@@ -247,10 +247,10 @@ static pfn_ahb_recv g_ahb_recv;
 static pfn_ahb_lock g_ahb_lock;
 static pfn_ahb_unlock g_ahb_unlock;
 static int g_ahb_resolved;
-static int g_guest_client_queue_n; /* hwnd-sized client QUEUE count (knife7/8) */
-static int g_guest_fence_log_n;    /* first ~20 client fence_in logs (knife8) */
+static int g_guest_client_queue_n; /* hwnd-sized client QUEUE count */
+static int g_guest_fence_log_n;    /* first ~20 client fence_in logs */
 
-/* knife8: sync_wait from libsync.so, else poll(fd) up to 3000ms. */
+/* sync_wait from libsync.so, else poll(fd) up to 3000ms. */
 typedef int (*pfn_sync_wait)(int fence, int timeout_ms);
 static pfn_sync_wait g_sync_wait;
 static int g_sync_resolved;
@@ -337,7 +337,7 @@ static void amphora_resolve_ahb(void)
          (void *)g_ahb_lock, (void *)g_ahb_unlock);
 }
 
-/* knife7: log native_handle fd identity (st_dev/st_ino/st_size) for fork match. */
+/* Log native_handle fd identity (st_dev/st_ino/st_size) for fork match. */
 static void amphora_log_nh_fstat(const char *tag, const native_handle_t *nh)
 {
     int i, nints;
@@ -367,7 +367,7 @@ static void amphora_log_nh_fstat(const char *tag, const native_handle_t *nh)
     }
 }
 
-/* knife8: after fence-wait — sample guest AHB; if BLACK at q50/q100, CPU-fill magenta. */
+/* After fence-wait — sample guest AHB; if BLACK at q50/q100, CPU-fill magenta. */
 static const char *amphora_class_rgba(int r, int g, int b)
 {
     if ((r > 217 ? r - 217 : 217 - r) <= 40 &&
@@ -381,7 +381,7 @@ static const char *amphora_class_rgba(int r, int g, int b)
     return "OTHER";
 }
 
-static void amphora_guest_queue_knife(struct amphora_buf *buf)
+static void amphora_guest_queue_sync(struct amphora_buf *buf)
 {
     int queue_n, w, h, stride_px, cx, cy, rc;
     void *bits = NULL;
@@ -456,8 +456,8 @@ static void amphora_guest_queue_knife(struct amphora_buf *buf)
     g_ahb_unlock(buf->ahb, NULL);
     bits = NULL;
 
-    /* knife8 bind probe: if still BLACK after fence-wait, CPU-fill magenta.
-     * knife10: gate fill — success must not come from CPU fill unless AMPHORA_CPU_FILL=1. */
+    /* Bind probe: if still BLACK after fence-wait, CPU-fill magenta.
+     * Gate fill — success must not come from CPU fill unless AMPHORA_CPU_FILL=1. */
     if (cls[0] != 'B') /* not BLACK */
         return;
 
@@ -820,7 +820,7 @@ static int win_queue(struct ANativeWindow *window, struct ANativeWindowBuffer *b
     h = buf->height;
     is_client = (w >= 200 && h >= 200 && w <= 900 && h <= 700);
 
-    /* knife8: log fence_in on first ~20 client queues (before wait/close). */
+    /* Log fence_in on first ~20 client queues (before wait/close). */
     if (is_client && g_guest_fence_log_n < 20) {
         g_guest_fence_log_n++;
         LOGI("queue id=%d fence_in=%d anwb=%p ahb=%p handle=%p",
@@ -828,11 +828,11 @@ static int win_queue(struct ANativeWindow *window, struct ANativeWindowBuffer *b
              (void *)buf->buffer.handle);
     }
 
-    /* knife8: wait present fence BEFORE QUEUE sock and guest-readback. */
+    /* Wait present fence BEFORE QUEUE sock and guest-readback. */
     amphora_wait_present_fence(fence);
 
-    /* knife8: sample (and maybe CPU-fill) after GPU fence signaled. */
-    amphora_guest_queue_knife(buf);
+    /* Sample (and maybe CPU-fill) after GPU fence signaled. */
+    amphora_guest_queue_sync(buf);
     pthread_mutex_lock(&win->lock);
     if (write_full(win->sock, &cmd, sizeof(cmd)) ||
         write_full(win->sock, &buf->buffer_id, sizeof(buf->buffer_id)) ||
@@ -858,7 +858,7 @@ static int win_cancel(struct ANativeWindow *window, struct ANativeWindowBuffer *
         if (fence >= 0) close(fence);
         return -EINVAL;
     }
-    /* knife8: wait present fence before cancel sock (same as queue). */
+    /* Wait present fence before cancel sock (same as queue). */
     amphora_wait_present_fence(fence);
     pthread_mutex_lock(&win->lock);
     if (write_full(win->sock, &cmd, sizeof(cmd)) ||
@@ -1432,7 +1432,7 @@ __attribute__((constructor))
 static void amphora_wsi_ctor(void)
 {
     pthread_t th, th_sc;
-    LOGI("wsi ctor pid=%d knife13-src-createswapchain", (int)getpid());
+    LOGI("wsi ctor pid=%d src-createswapchain", (int)getpid());
     /* Runtime hook installer disabled; Wine CreateSwapchain calls amphora_ahb_sc_*. */
     if (pthread_create(&th, NULL, wsi_serve, NULL) == 0)
         pthread_detach(th);

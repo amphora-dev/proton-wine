@@ -334,7 +334,7 @@ static const struct vulkan_driver_funcs android_vulkan_driver_funcs =
 };
 
 
-/* knife13: source-path AHB swapchain. x86_64 wine cannot dlsym aarch64
+/* Source-path AHB swapchain. x86_64 wine cannot dlsym aarch64
  * libamphora_wsi.so; IPC to wsi-sc-%pid.sock which calls amphora_ahb_sc_*.
  * No runtime table/GIPA/GDPA hooks. */
 #define AMPHORA_SC_SOCK_FMT "/data/user/0/app.amphora/files/wineandroid/wsi-sc-%d.sock"

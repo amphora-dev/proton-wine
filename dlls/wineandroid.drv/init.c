@@ -448,13 +448,29 @@ static void *bridge_symbol( const char *name )
     return handle ? dlsym( handle, name ) : NULL;
 }
 
+/* Logging is optional: some box64 builds cannot load liblog at all. */
+static int stub_android_log_print( int prio, const char *tag, const char *fmt, ... )
+{
+    (void)prio;
+    (void)tag;
+    (void)fmt;
+    return 0;
+}
+
 #define LOAD_FUNCPTR(lib, func) do { \
     if ((p##func = (typeof(p##func))bridge_symbol( #func )) == NULL && \
         (p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
-        { ERR( "can't find symbol %s\n", #func); abort(); return; } \
+        { \
+            const char *amphora = getenv( "AMPHORA_WINEANDROID" ); \
+            if (amphora && amphora[0] == '1' && amphora[1] == '\0') { \
+                TRACE( "amphora host mode: symbol %s not found (using host IPC)\n", #func ); \
+            } else { \
+                ERR( "can't find symbol %s\n", #func); abort(); return; \
+            } \
+        } \
     } while(0)
 
-DECL_FUNCPTR( __android_log_print );
+typeof(__android_log_print) * p__android_log_print = stub_android_log_print;
 DECL_FUNCPTR( ANativeWindow_fromSurface );
 DECL_FUNCPTR( ANativeWindow_release );
 DECL_FUNCPTR( AHardwareBuffer_describe );
@@ -470,15 +486,6 @@ DECL_FUNCPTR( ALooper_forThread );
 DECL_FUNCPTR( ALooper_addFd );
 DECL_FUNCPTR( ALooper_removeFd );
 DECL_FUNCPTR( ALooper_release );
-
-/* Logging is optional: some box64 builds cannot load liblog at all. */
-static int stub_android_log_print( int prio, const char *tag, const char *fmt, ... )
-{
-    (void)prio;
-    (void)tag;
-    (void)fmt;
-    return 0;
-}
 
 static void load_android_libs(void)
 {
@@ -502,14 +509,24 @@ static void load_android_libs(void)
 
     {
         void *probe = bridge_symbol( "ALooper_forThread" );
+        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
+        BOOL amphora_host = amphora && amphora[0] == '1' && amphora[1] == '\0';
+
         ERR( "load_android_libs: loader=%s bridge=%s android=%s/%s log=%s/%s\n", loader_src,
              probe ? "ok" : "none", android_src ? android_src : "FAIL", probe ? "via-bridge" : "direct",
              log_src ? log_src : "FAIL", probe ? "via-bridge" : "direct" );
         if (!libandroid && !probe)
         {
-            ERR( "failed to load libandroid.so: %s\n", dlerror() );
-            abort();
-            return;
+            if (amphora_host)
+            {
+                ERR( "amphora host mode: libandroid.so not accessible, continuing with host IPC\n" );
+            }
+            else
+            {
+                ERR( "failed to load libandroid.so: %s\n", dlerror() );
+                abort();
+                return;
+            }
         }
     }
     if (!(p__android_log_print = (typeof(p__android_log_print))bridge_symbol( "__android_log_print" )) &&
