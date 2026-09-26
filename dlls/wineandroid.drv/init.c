@@ -42,10 +42,6 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 
-#ifndef WINE_JAVA_CLASS
-#define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
-#endif
-
 WINE_DEFAULT_DEBUG_CHANNEL(android);
 
 unsigned int screen_width = 0;
@@ -330,16 +326,6 @@ static const struct user_driver_funcs android_drv_funcs =
 };
 
 
-static const JNINativeMethod methods[] =
-{
-    { "wine_desktop_changed", "(II)V", desktop_changed },
-    { "wine_config_changed", "(I)V", config_changed },
-    { "wine_surface_changed", "(ILandroid/view/Surface;Z)V", surface_changed },
-    { "wine_motion_event", "(IIIIII)Z", motion_event },
-    { "wine_keyboard_event", "(IIII)Z", keyboard_event },
-    { "wine_init", "()V", wine_init_jni }
-};
-
 /* box64 intercepts dlopen/dlsym for the libs it wraps (libdl.so, libc.so,
  * libandroid.so — the latter for SysV-shm emulation) and hands out fake
  * handles whose symbol tables hide ANativeWindow_*, AHardwareBuffer_* and
@@ -409,44 +395,26 @@ static void *real_dlsym( void *handle, const char *name )
 
 #define DECL_FUNCPTR(f) typeof(f) * p##f = NULL
 
-/* Under box64 the unixlib is x86_64: every dlopen/dlsym goes through box64's
- * wrappers, which hide the NDK symbols behind a fake libandroid handle, and
- * bionic's private __loader_* entry points are unreachable from x86 code. But
- * dlopen of a name box64 does not wrap returns a real handle, and dlsym on a
- * real handle yields callable bridges. libamphora_wsi.so is LD_PRELOAD'd into
- * the guest and links libandroid/liblog, so its dependency tree carries every
- * NDK symbol we need — look them up there first (same pattern as the GL probe
- * in opengl.c). */
-static void *bridge_symbol( const char *name )
+/* Amphora host mode: the host process (no JVM) serves the SEQPACKET device
+ * protocol and sets AMPHORA_WINEANDROID=1. Cached on first call. */
+BOOL amphora_host_mode(void)
 {
-    static void *handle;
-    static int tried;
-    if (!tried)
+    static int host = -1;
+    if (host == -1)
     {
-        const char *preload, *p;
-        tried = 1;
-        /* Bare-name dlopen cannot see the APK lib dir; LD_PRELOAD carries the
-         * absolute path of the helper (box64's dlsym has no RTLD_DEFAULT). */
-        if ((preload = getenv( "LD_PRELOAD" )))
-        {
-            for (p = preload; *p && !handle; )
-            {
-                const char *end = p + strcspn( p, ": " );
-                char path[4096];
-                size_t len = end - p;
-                if (len && len < sizeof(path))
-                {
-                    memcpy( path, p, len );
-                    path[len] = 0;
-                    handle = dlopen( path, RTLD_NOW );
-                }
-                p = *end ? end + 1 : end;
-            }
-        }
-        if (!handle) handle = dlopen( "libamphora_wsi.so", RTLD_NOW );
+        const char *v = getenv( "AMPHORA_WINEANDROID" );
+        host = (v && v[0] == '1' && v[1] == '\0');
     }
-    return handle ? dlsym( handle, name ) : NULL;
+    return host;
 }
+
+#define LOAD_FUNCPTR_REQUIRED(lib, func) do { \
+    if ((p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
+    { \
+        ERR( "can't find required symbol %s (box64 libandroid wrap missing?)\n", #func ); \
+        abort(); return; \
+    } \
+} while(0)
 
 /* Logging is optional: some box64 builds cannot load liblog at all. */
 static int stub_android_log_print( int prio, const char *tag, const char *fmt, ... )
@@ -457,22 +425,23 @@ static int stub_android_log_print( int prio, const char *tag, const char *fmt, .
     return 0;
 }
 
-#define LOAD_FUNCPTR(lib, func) do { \
-    if ((p##func = (typeof(p##func))bridge_symbol( #func )) == NULL && \
+#define LOAD_FUNCPTR_REQUIRED(lib, func) do { \
+    if ((p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
+    { \
+        ERR( "can't find required symbol %s (box64 libandroid wrap missing?)\n", #func ); \
+        abort(); return; \
+    } \
+} while(0)
+
+#define LOAD_FUNCPTR_JNI(lib, func) do { \
+    if (!is_amphora_host() && \
         (p##func = (typeof(p##func))real_dlsym( lib, #func )) == NULL) \
-        { \
-            const char *amphora = getenv( "AMPHORA_WINEANDROID" ); \
-            if (amphora && amphora[0] == '1' && amphora[1] == '\0') { \
-                TRACE( "amphora host mode: symbol %s not found (using host IPC)\n", #func ); \
-            } else { \
-                ERR( "can't find symbol %s\n", #func); abort(); return; \
-            } \
-        } \
-    } while(0)
+    { \
+        ERR( "can't find symbol %s\n", #func ); abort(); return; \
+    } \
+} while(0)
 
 typeof(__android_log_print) * p__android_log_print = stub_android_log_print;
-DECL_FUNCPTR( ANativeWindow_fromSurface );
-DECL_FUNCPTR( ANativeWindow_release );
 DECL_FUNCPTR( AHardwareBuffer_describe );
 DECL_FUNCPTR( AHardwareBuffer_acquire );
 DECL_FUNCPTR( AHardwareBuffer_release );
@@ -481,23 +450,16 @@ DECL_FUNCPTR( AHardwareBuffer_unlock );
 DECL_FUNCPTR( AHardwareBuffer_recvHandleFromUnixSocket );
 DECL_FUNCPTR( AHardwareBuffer_sendHandleToUnixSocket );
 DECL_FUNCPTR( ANativeWindowBuffer_getHardwareBuffer );
-DECL_FUNCPTR( ALooper_acquire );
-DECL_FUNCPTR( ALooper_forThread );
-DECL_FUNCPTR( ALooper_addFd );
-DECL_FUNCPTR( ALooper_removeFd );
-DECL_FUNCPTR( ALooper_release );
 
 static void load_android_libs(void)
 {
-    /* Absolute paths first: the bare soname resolves against the guest's
-     * LD_LIBRARY_PATH (imagefs usr/lib) before /system on some setups. */
-    /* lib*-real.so are symlinks published by libamphora_wsi's ctor under names
-     * box64 does not wrap; bare/absolute libandroid.so hits box64's fake
-     * handle. Absolute paths first for plain devices. */
+    /* Bare soname first: under box64 only the bare name hits the wrapped
+     * libandroid; a path with '/' makes box64 look for an x86_64 ELF and fail.
+     * The absolute path is for non-box64 builds. */
     static const char *const android_names[] =
-        { "libandroid-real.so", "/system/lib64/libandroid.so", "/system/lib/libandroid.so", "libandroid.so", NULL };
+        { "libandroid.so", "/system/lib64/libandroid.so", NULL };
     static const char *const log_names[] =
-        { "liblog-real.so", "/system/lib64/liblog.so", "/system/lib/liblog.so", "liblog.so", NULL };
+        { "liblog.so", "/system/lib64/liblog.so", NULL };
     void *libandroid = NULL, *liblog = NULL;
     const char *const *name;
     const char *android_src = NULL, *log_src = NULL;
@@ -507,53 +469,32 @@ static void load_android_libs(void)
     for (name = log_names; *name && !liblog; name++)
         if ((liblog = real_dlopen( *name ))) log_src = *name;
 
+    if (!libandroid)
     {
-        void *probe = bridge_symbol( "ALooper_forThread" );
-        const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-        BOOL amphora_host = amphora && amphora[0] == '1' && amphora[1] == '\0';
-
-        ERR( "load_android_libs: loader=%s bridge=%s android=%s/%s log=%s/%s\n", loader_src,
-             probe ? "ok" : "none", android_src ? android_src : "FAIL", probe ? "via-bridge" : "direct",
-             log_src ? log_src : "FAIL", probe ? "via-bridge" : "direct" );
-        if (!libandroid && !probe)
-        {
-            if (amphora_host)
-            {
-                ERR( "amphora host mode: libandroid.so not accessible, continuing with host IPC\n" );
-            }
-            else
-            {
-                ERR( "failed to load libandroid.so: %s\n", dlerror() );
-                abort();
-                return;
-            }
-        }
+        ERR( "failed to load libandroid.so: %s\n", dlerror() );
+        abort();
+        return;
     }
-    if (!(p__android_log_print = (typeof(p__android_log_print))bridge_symbol( "__android_log_print" )) &&
-        (!liblog || !(p__android_log_print = (typeof(p__android_log_print))real_dlsym( liblog, "__android_log_print" ))))
+    ERR( "load_android_libs: loader=%s android=%s log=%s host=%d\n", loader_src,
+         android_src ? android_src : "FAIL", log_src ? log_src : "FAIL", amphora_host_mode() );
+
+    if (!liblog || !(p__android_log_print = (typeof(p__android_log_print))real_dlsym( liblog, "__android_log_print" )))
     {
         ERR( "failed to load liblog.so: %s - using stub\n", dlerror() );
         p__android_log_print = stub_android_log_print;
     }
-    LOAD_FUNCPTR( libandroid, ANativeWindow_fromSurface );
-    LOAD_FUNCPTR( libandroid, ANativeWindow_release );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_describe );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_acquire );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_release );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_lock );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_unlock );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_recvHandleFromUnixSocket );
-    LOAD_FUNCPTR( libandroid, AHardwareBuffer_sendHandleToUnixSocket );
-    LOAD_FUNCPTR( libandroid, ANativeWindowBuffer_getHardwareBuffer );
-    LOAD_FUNCPTR( libandroid, ALooper_acquire );
-    LOAD_FUNCPTR( libandroid, ALooper_forThread );
-    LOAD_FUNCPTR( libandroid, ALooper_addFd );
-    LOAD_FUNCPTR( libandroid, ALooper_removeFd );
-    LOAD_FUNCPTR( libandroid, ALooper_release );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_describe );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_acquire );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_release );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_lock );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_unlock );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_recvHandleFromUnixSocket );
+    LOAD_FUNCPTR_REQUIRED( libandroid, AHardwareBuffer_sendHandleToUnixSocket );
+    LOAD_FUNCPTR_REQUIRED( libandroid, ANativeWindowBuffer_getHardwareBuffer );
 }
 
 #undef DECL_FUNCPTR
-#undef LOAD_FUNCPTR
+#undef LOAD_FUNCPTR_REQUIRED
 
 NTSTATUS __wine_unix_lib_init(void)
 {
@@ -568,20 +509,6 @@ NTSTATUS __wine_unix_lib_init(void)
 
     __wine_set_user_driver( &android_drv_funcs, WINE_GDI_DRIVER_VERSION );
     return STATUS_SUCCESS;
-}
-
-jint JNI_OnLoad( JavaVM *vm, void *reserved )
-{
-    JNIEnv *env;
-    jclass class;
-
-    load_android_libs();
-
-    if ((*vm)->AttachCurrentThread( vm, &env, NULL ) != JNI_OK) return JNI_ERR;
-    if (!(class = (*env)->FindClass( env, WINE_JAVA_CLASS ))) return JNI_ERR;
-    (*env)->RegisterNatives( env, class, methods, ARRAY_SIZE( methods ));
-    (*env)->DeleteLocalRef( env, class );
-    return JNI_VERSION_1_6;
 }
 
 /* Proton ntdll only dlsyms __wine_unix_call_funcs (no upstream __wine_unix_lib_init

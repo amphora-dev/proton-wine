@@ -164,7 +164,7 @@ static struct ANativeWindow *get_ioctl_window( HWND hwnd )
 }
 
 
-/* Handling of events coming from the Java side */
+/* Events coming from the host side via the event pipe */
 
 struct java_event
 {
@@ -178,165 +178,6 @@ int event_source = -1;
 static DWORD desktop_tid;
 
 extern int event_sink;
-
-/***********************************************************************
- *           send_event
- */
-int send_event( const union event_data *data )
-{
-    int res;
-
-    if ((res = write( event_sink, data, sizeof(*data) )) != sizeof(*data))
-    {
-        p__android_log_print( ANDROID_LOG_ERROR, "wine", "failed to send event" );
-        return -1;
-    }
-    return 0;
-}
-
-
-/***********************************************************************
- *           desktop_changed
- *
- * JNI callback, runs in the context of the Java thread.
- */
-void desktop_changed( JNIEnv *env, jobject obj, jint width, jint height )
-{
-    union event_data data;
-
-    memset( &data, 0, sizeof(data) );
-    data.type = DESKTOP_CHANGED;
-    data.desktop.width = width;
-    data.desktop.height = height;
-    p__android_log_print( ANDROID_LOG_INFO, "wine", "desktop_changed: %ux%u", width, height );
-    send_event( &data );
-}
-
-
-/***********************************************************************
- *           config_changed
- *
- * JNI callback, runs in the context of the Java thread.
- */
-void config_changed( JNIEnv *env, jobject obj, jint dpi )
-{
-    union event_data data;
-
-    memset( &data, 0, sizeof(data) );
-    data.type = CONFIG_CHANGED;
-    data.cfg.dpi = dpi;
-    p__android_log_print( ANDROID_LOG_INFO, "wine", "config_changed: %u dpi", dpi );
-    send_event( &data );
-}
-
-
-/***********************************************************************
- *           surface_changed
- *
- * JNI callback, runs in the context of the Java thread.
- */
-void surface_changed( JNIEnv *env, jobject obj, jint win, jobject surface, jboolean client )
-{
-    union event_data data;
-
-    memset( &data, 0, sizeof(data) );
-    data.surface.hwnd = LongToHandle( win );
-    data.surface.client = client;
-    if (surface)
-    {
-        int width, height;
-        ANativeWindow *win = pANativeWindow_fromSurface( env, surface );
-
-        if (win->query( win, NATIVE_WINDOW_WIDTH, &width ) < 0) width = 0;
-        if (win->query( win, NATIVE_WINDOW_HEIGHT, &height ) < 0) height = 0;
-        data.surface.width = width;
-        data.surface.height = height;
-        p__android_log_print( ANDROID_LOG_INFO, "wine", "surface_changed: %p %p %s %ux%u",
-                              data.surface.hwnd, win, client ? "client" : "whole", width, height );
-
-        register_native_window( data.surface.hwnd, win, data.surface.client );
-    }
-    data.type = SURFACE_CHANGED;
-    send_event( &data );
-}
-
-
-/***********************************************************************
- *           motion_event
- *
- * JNI callback, runs in the context of the Java thread.
- */
-jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action, jint x, jint y, jint state, jint vscroll )
-{
-    static LONG button_state;
-    union event_data data;
-    int prev_state;
-
-    int mask = action & AMOTION_EVENT_ACTION_MASK;
-
-    if (!( mask == AMOTION_EVENT_ACTION_DOWN ||
-           mask == AMOTION_EVENT_ACTION_UP ||
-           mask == AMOTION_EVENT_ACTION_CANCEL ||
-           mask == AMOTION_EVENT_ACTION_SCROLL ||
-           mask == AMOTION_EVENT_ACTION_MOVE ||
-           mask == AMOTION_EVENT_ACTION_HOVER_MOVE ||
-           mask == AMOTION_EVENT_ACTION_BUTTON_PRESS ||
-           mask == AMOTION_EVENT_ACTION_BUTTON_RELEASE ))
-        return JNI_FALSE;
-
-    /* make sure a subsequent AMOTION_EVENT_ACTION_UP is not treated as a touch event */
-    if (mask == AMOTION_EVENT_ACTION_BUTTON_RELEASE) state |= 0x80000000;
-
-    prev_state = InterlockedExchange( &button_state, state );
-
-    data.type = MOTION_EVENT;
-    data.motion.hwnd = LongToHandle( win );
-    data.motion.input.type           = INPUT_MOUSE;
-    data.motion.input.mi.dx          = x;
-    data.motion.input.mi.dy          = y;
-    data.motion.input.mi.mouseData   = 0;
-    data.motion.input.mi.time        = 0;
-    data.motion.input.mi.dwExtraInfo = 0;
-    data.motion.input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-    switch (action & AMOTION_EVENT_ACTION_MASK)
-    {
-    case AMOTION_EVENT_ACTION_DOWN:
-    case AMOTION_EVENT_ACTION_BUTTON_PRESS:
-        if ((state & ~prev_state) & AMOTION_EVENT_BUTTON_PRIMARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
-        if ((state & ~prev_state) & AMOTION_EVENT_BUTTON_SECONDARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
-        if ((state & ~prev_state) & AMOTION_EVENT_BUTTON_TERTIARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
-        if (!(state & ~prev_state)) /* touch event */
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
-        break;
-    case AMOTION_EVENT_ACTION_UP:
-    case AMOTION_EVENT_ACTION_CANCEL:
-    case AMOTION_EVENT_ACTION_BUTTON_RELEASE:
-        if ((prev_state & ~state) & AMOTION_EVENT_BUTTON_PRIMARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-        if ((prev_state & ~state) & AMOTION_EVENT_BUTTON_SECONDARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
-        if ((prev_state & ~state) & AMOTION_EVENT_BUTTON_TERTIARY)
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
-        if (!(prev_state & ~state)) /* touch event */
-            data.motion.input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-        break;
-    case AMOTION_EVENT_ACTION_SCROLL:
-        data.motion.input.mi.dwFlags |= MOUSEEVENTF_WHEEL;
-        data.motion.input.mi.mouseData = vscroll < 0 ? -WHEEL_DELTA : WHEEL_DELTA;
-        break;
-    case AMOTION_EVENT_ACTION_MOVE:
-    case AMOTION_EVENT_ACTION_HOVER_MOVE:
-        break;
-    default:
-        return JNI_FALSE;
-    }
-    send_event( &data );
-    return JNI_TRUE;
-}
-
 
 /***********************************************************************
  *           init_event_queue
@@ -638,15 +479,12 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
 
             /* Wine DIB is BGRA; Amphora Surface stays PF_RGBA_8888 (SF rejects
              * fmt=5 / BGRA — HA262AAH full-system crash). Swap R↔B on copy. */
+            if (amphora_host_mode())
             {
-                const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-                if (amphora && amphora[0] == '1')
+                for (x = 0; x < width; x++)
                 {
-                    for (x = 0; x < width; x++)
-                    {
-                        DWORD c = dst[x];
-                        dst[x] = (c & 0xff00ff00) | ((c & 0x00ff0000) >> 16) | ((c & 0x000000ff) << 16);
-                    }
+                    DWORD c = dst[x];
+                    dst[x] = (c & 0xff00ff00) | ((c & 0x00ff0000) >> 16) | ((c & 0x000000ff) << 16);
                 }
             }
 

@@ -74,8 +74,15 @@ static int amphora_wsi_create_surface( uint64_t vk_instance, int sock,
     int fd = -1, i, q;
     int32_t sock32 = sock, reply = -EIO, width = 640, height = 480;
     uint64_t surface = 0;
+    const char *wsi_dir = getenv( "AMPHORA_WSI_DIR" );
 
     if (out_surface) *out_surface = 0;
+
+    if (!wsi_dir || !wsi_dir[0])
+    {
+        ERR( "AMPHORA_WSI_DIR not set; cannot locate amphora WSI socket\n" );
+        return -ENOENT;
+    }
 
     /* Query ANW size on the wine thread (ioctl works here) before connecting to
      * the aarch64 WSI helper — host create must not sock-query the adapter. */
@@ -85,8 +92,12 @@ static int amphora_wsi_create_surface( uint64_t vk_instance, int sock,
         if (!window->query( window, NATIVE_WINDOW_HEIGHT, &q ) && q > 0) height = q;
     }
 
-    snprintf( path, sizeof(path), "/data/user/0/app.amphora/files/wineandroid/wsi-%d.sock",
-              (int)getpid() );
+    q = snprintf( path, sizeof(path), "%s/wsi-%d.sock", wsi_dir, (int)getpid() );
+    if (q < 0 || (size_t)q >= sizeof(path) || (size_t)q >= sizeof(addr.sun_path))
+    {
+        ERR( "amphora WSI socket path too long: %s\n", debugstr_a(wsi_dir) );
+        return -ENAMETOOLONG;
+    }
     ERR( "amphora WSI bridge connect %s inst=0x%s sock=%d size=%dx%d\n",
          path, wine_dbgstr_longlong( vk_instance ), sock, width, height );
 
@@ -183,8 +194,6 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
     PFN_android_vkCreateAndroidSurfaceKHR p_vkCreateAndroidSurfaceKHR;
     VkResult res;
 
-    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-
     TRACE( "%p %u %p %p %p\n", hwnd, raw, instance, handle, client );
     (void)raw;
 
@@ -194,7 +203,7 @@ static VkResult ANDROID_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
 
     /* Dedicated client ANW (CREATE_WINDOW opengl=1). Do NOT use the GDI parent
      * (opengl=0) that desktop/winefile LOCK — that ANW is NATIVE_WINDOW_IN_USE. */
-    if (amphora && amphora[0] == '1' && amphora[1] == '\0')
+    if (amphora_host_mode())
     {
         struct ANativeWindow *tmp;
         int i;
@@ -335,9 +344,8 @@ static const struct vulkan_driver_funcs android_vulkan_driver_funcs =
 
 
 /* Source-path AHB swapchain. x86_64 wine cannot dlsym aarch64
- * libamphora_wsi.so; IPC to wsi-sc-%pid.sock which calls amphora_ahb_sc_*.
- * No runtime table/GIPA/GDPA hooks. */
-#define AMPHORA_SC_SOCK_FMT "/data/user/0/app.amphora/files/wineandroid/wsi-sc-%d.sock"
+ * libamphora_wsi.so; IPC to $AMPHORA_WSI_DIR/wsi-sc-%pid.sock which calls
+ * amphora_ahb_sc_*. No runtime table/GIPA/GDPA hooks. */
 enum {
     AMPHORA_SC_OP_CREATE = 1,
     AMPHORA_SC_OP_DESTROY = 2,
@@ -352,7 +360,19 @@ static int amphora_sc_connect(void)
     char path[128];
     struct sockaddr_un addr;
     int fd, i;
-    snprintf( path, sizeof(path), AMPHORA_SC_SOCK_FMT, (int)getpid() );
+    const char *wsi_dir = getenv( "AMPHORA_WSI_DIR" );
+
+    if (!wsi_dir || !wsi_dir[0])
+    {
+        ERR( "AMPHORA_WSI_DIR not set; cannot locate amphora swapchain socket\n" );
+        return -1;
+    }
+    i = snprintf( path, sizeof(path), "%s/wsi-sc-%d.sock", wsi_dir, (int)getpid() );
+    if (i < 0 || (size_t)i >= sizeof(path) || (size_t)i >= sizeof(addr.sun_path))
+    {
+        ERR( "amphora swapchain socket path too long: %s\n", debugstr_a(wsi_dir) );
+        return -1;
+    }
     for (i = 0; i < 50; i++)
     {
         fd = socket( AF_UNIX, SOCK_STREAM, 0 );
@@ -398,8 +418,7 @@ void amphora_wine_vkStashDevice( VkDevice device, VkPhysicalDevice phys )
     int fd;
     int32_t op = AMPHORA_SC_OP_STASH, ret = -1;
     uint64_t d = (uint64_t)(UINT_PTR)device, p = (uint64_t)(UINT_PTR)phys;
-    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
-    if (!amphora || amphora[0] != '1' || amphora[1] != '\0') return;
+    if (!amphora_host_mode()) return;
     fd = amphora_sc_connect();
     if (fd < 0) return;
     if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||

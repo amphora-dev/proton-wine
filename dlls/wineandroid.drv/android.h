@@ -25,11 +25,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <jni.h>
 #include <android/log.h>
 #include <android/input.h>
-#include <android/looper.h>
-#include <android/native_window_jni.h>
+#include <android/native_window.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -46,8 +44,6 @@
 
 #define DECL_FUNCPTR(f) extern typeof(f) * p##f
 DECL_FUNCPTR( __android_log_print );
-DECL_FUNCPTR( ANativeWindow_fromSurface );
-DECL_FUNCPTR( ANativeWindow_release );
 
 #ifdef __ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__
 extern struct AHardwareBuffer* ANativeWindowBuffer_getHardwareBuffer(struct ANativeWindowBuffer* anwb) __INTRODUCED_IN(26);
@@ -60,11 +56,6 @@ DECL_FUNCPTR( AHardwareBuffer_unlock );
 DECL_FUNCPTR( AHardwareBuffer_recvHandleFromUnixSocket );
 DECL_FUNCPTR( AHardwareBuffer_sendHandleToUnixSocket );
 DECL_FUNCPTR( ANativeWindowBuffer_getHardwareBuffer );
-DECL_FUNCPTR( ALooper_acquire );
-DECL_FUNCPTR( ALooper_forThread );
-DECL_FUNCPTR( ALooper_addFd );
-DECL_FUNCPTR( ALooper_removeFd );
-DECL_FUNCPTR( ALooper_release );
 #endif
 
 #undef DECL_FUNCPTR
@@ -89,7 +80,6 @@ extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct 
  */
 
 extern void createDesktopView( int *event_source );
-extern void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL client );
 extern struct ANativeWindow *create_ioctl_window( HWND hwnd, BOOL opengl );
 extern struct ANativeWindow *grab_ioctl_window( struct ANativeWindow *window );
 extern void release_ioctl_window( struct ANativeWindow *window );
@@ -149,18 +139,7 @@ enum android_window_messages
 extern void init_monitors( int width, int height );
 extern void set_screen_dpi( DWORD dpi );
 extern void update_keyboard_lock_state( WORD vkey, UINT state );
-
-/* JNI entry points */
-extern void looper_init( JNIEnv *env, jobject obj );
-extern void wine_init_jni( JNIEnv *env, jobject obj );
-extern void desktop_changed( JNIEnv *env, jobject obj, jint width, jint height );
-extern void config_changed( JNIEnv *env, jobject obj, jint dpi );
-extern void surface_changed( JNIEnv *env, jobject obj, jint win, jobject surface,
-                             jboolean client );
-extern jboolean motion_event( JNIEnv *env, jobject obj, jint win, jint action,
-                              jint x, jint y, jint state, jint vscroll );
-extern jboolean keyboard_event( JNIEnv *env, jobject obj, jint win, jint action,
-                                jint keycode, jint state );
+extern BOOL amphora_host_mode(void);
 
 enum event_type
 {
