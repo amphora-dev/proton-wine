@@ -353,6 +353,7 @@ enum {
     AMPHORA_SC_OP_ACQUIRE = 4,
     AMPHORA_SC_OP_PRESENT = 5,
     AMPHORA_SC_OP_STASH = 6,
+    AMPHORA_SC_OP_PRESENT_FENCE = 7, /* PRESENT + int32 render-done sync fd */
 };
 
 static int amphora_sc_connect(void)
@@ -572,16 +573,18 @@ VkResult amphora_wine_vkAcquireNextImageKHR( VkDevice device, VkSwapchainKHR swa
     return (VkResult)ret;
 }
 
-__attribute__((visibility("default")))
-VkResult amphora_wine_vkQueuePresentKHR( VkQueue queue, const VkPresentInfoKHR *info )
+/* fence_fd >= -1 sends OP_PRESENT_FENCE: libamphora_wsi (same process) takes
+ * ownership and hands it to queueBuffer. -2 sends the plain OP_PRESENT. */
+static VkResult amphora_sc_present( VkQueue queue, const VkPresentInfoKHR *info, int fence_fd )
 {
     int fd;
-    int32_t op = AMPHORA_SC_OP_PRESENT, ret;
+    int32_t op = fence_fd >= -1 ? AMPHORA_SC_OP_PRESENT_FENCE : AMPHORA_SC_OP_PRESENT, ret;
+    int32_t fence = fence_fd;
     uint64_t q;
     uint32_t wait_n, sc_n, i;
-    if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info) goto fail_fence;
     fd = amphora_sc_connect();
-    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    if (fd < 0) goto fail_fence;
     q = (uint64_t)(UINT_PTR)queue;
     wait_n = info->waitSemaphoreCount;
     sc_n = info->swapchainCount;
@@ -591,28 +594,52 @@ VkResult amphora_wine_vkQueuePresentKHR( VkQueue queue, const VkPresentInfoKHR *
         amphora_sc_io_write( fd, &q, sizeof(q) ) ||
         amphora_sc_io_write( fd, &wait_n, sizeof(wait_n) ) ||
         amphora_sc_io_write( fd, &sc_n, sizeof(sc_n) ))
-    { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+        goto fail;
     for (i = 0; i < wait_n; i++)
     {
         uint64_t s = (uint64_t)(UINT_PTR)info->pWaitSemaphores[i];
-        if (amphora_sc_io_write( fd, &s, sizeof(s) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+        if (amphora_sc_io_write( fd, &s, sizeof(s) )) goto fail;
     }
     for (i = 0; i < sc_n; i++)
     {
         uint64_t s = (uint64_t)(UINT_PTR)info->pSwapchains[i];
         uint32_t idx = info->pImageIndices[i];
         if (amphora_sc_io_write( fd, &s, sizeof(s) ) || amphora_sc_io_write( fd, &idx, sizeof(idx) ))
-        { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+            goto fail;
     }
-    if (amphora_sc_io_read( fd, &ret, sizeof(ret) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+    if (op == AMPHORA_SC_OP_PRESENT_FENCE)
+    {
+        if (amphora_sc_io_write( fd, &fence, sizeof(fence) )) goto fail;
+        fence = -1; /* libamphora_wsi owns it now */
+    }
+    if (amphora_sc_io_read( fd, &ret, sizeof(ret) )) goto fail;
     for (i = 0; i < sc_n; i++)
     {
         int32_t rr = 0;
-        if (amphora_sc_io_read( fd, &rr, sizeof(rr) )) { close( fd ); return VK_ERROR_INITIALIZATION_FAILED; }
+        if (amphora_sc_io_read( fd, &rr, sizeof(rr) )) goto fail;
         if (info->pResults) info->pResults[i] = (VkResult)rr;
     }
     close( fd );
     return (VkResult)ret;
+fail:
+    close( fd );
+fail_fence:
+    if (fence >= 0) close( fence );
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkQueuePresentKHR( VkQueue queue, const VkPresentInfoKHR *info )
+{
+    return amphora_sc_present( queue, info, -2 );
+}
+
+/* win32u calls this instead of QueueWaitIdle + amphora_wine_vkQueuePresentKHR:
+ * fence_fd is a SYNC_FD that signals when the frame is rendered (-1 = done). */
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkQueuePresentFenceKHR( VkQueue queue, const VkPresentInfoKHR *info, int fence_fd )
+{
+    return amphora_sc_present( queue, info, fence_fd < 0 ? -1 : fence_fd );
 }
 
 /**********************************************************************

@@ -68,6 +68,13 @@ static void *amphora_wineandroid_so(void)
 }
 
 
+/* Per-frame paths log the first few events, then every 600th. */
+static BOOL amphora_log_sample( unsigned int *counter )
+{
+    unsigned int n = __atomic_add_fetch( counter, 1, __ATOMIC_RELAXED );
+    return n <= 8 || n % 600 == 0;
+}
+
 static pthread_mutex_t g_amphora_pend_lock = PTHREAD_MUTEX_INITIALIZER;
 static VkSemaphore g_amphora_pend_sem;
 static VkFence g_amphora_pend_fence;
@@ -103,11 +110,17 @@ static void amphora_flush_pending_acquire( struct vulkan_device *device, VkQueue
         si.pSignalSemaphores = &sem;
     }
     r = device->p_vkQueueSubmit( host_queue, 1, &si, fence );
-    ERR( "amphora flush acquire signal res=%d sem=%p fence=%p q=%p\n",
-         (int)r, (void *)(UINT_PTR)sem, (void *)(UINT_PTR)fence, (void *)host_queue );
+    {
+        static unsigned int flush_n;
+        if (r || amphora_log_sample( &flush_n ))
+            ERR( "amphora flush acquire signal res=%d sem=%p fence=%p q=%p n=%u\n",
+                 (int)r, (void *)(UINT_PTR)sem, (void *)(UINT_PTR)fence, (void *)host_queue, flush_n );
+    }
 }
 
 static VkResult (*g_amphora_acquire_khr)( VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t * );
+typedef VkResult (*PFN_amphora_present_fence)( VkQueue, const VkPresentInfoKHR *, int );
+static PFN_amphora_present_fence g_amphora_present_fence;
 
 static VkResult amphora_host_acquire2( VkDevice host_device, const VkAcquireNextImageInfoKHR *info, uint32_t *image_index )
 {
@@ -152,6 +165,80 @@ static void amphora_bind_device_wsi( struct vulkan_device *device, VkPhysicalDev
         device->p_vkAcquireNextImage2KHR = amphora_host_acquire2;
     }
     if (present) device->p_vkQueuePresentKHR = present;
+    if (!g_amphora_present_fence)
+        g_amphora_present_fence = (PFN_amphora_present_fence)dlsym( mod, "amphora_wine_vkQueuePresentFenceKHR" );
+    ERR( "amphora bind present-fence=%p\n", g_amphora_present_fence );
+}
+
+/* Present without vkQueueWaitIdle: signal an exportable SYNC_FD semaphore after
+ * the present waits and hand the fd to libamphora_wsi, which passes it to the
+ * host queueBuffer (AOSP libvulkan passes its release fence the same way).
+ * One semaphore per host device; export resets it for the next frame. */
+#define AMPHORA_FENCE_DEVICES 8
+static struct
+{
+    VkDevice host_device;
+    VkSemaphore sem;
+    BOOL failed;
+} g_amphora_fence_devs[AMPHORA_FENCE_DEVICES];
+/* Guards the table and the submit+export pair, so two queues cannot signal the
+ * same semaphore twice before it is exported. */
+static pthread_mutex_t g_amphora_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Caller holds g_amphora_fence_lock. VK_NULL_HANDLE: export unavailable. */
+static VkSemaphore amphora_present_semaphore( struct vulkan_device *device )
+{
+    VkExportSemaphoreCreateInfo export_info = {.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+    VkSemaphoreCreateInfo create_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export_info};
+    VkResult res;
+    int i, slot = -1;
+    if (!g_amphora_present_fence) return VK_NULL_HANDLE;
+    for (i = 0; i < AMPHORA_FENCE_DEVICES; i++)
+    {
+        if (g_amphora_fence_devs[i].host_device == device->host.device)
+            return g_amphora_fence_devs[i].failed ? VK_NULL_HANDLE : g_amphora_fence_devs[i].sem;
+        if (!g_amphora_fence_devs[i].host_device && slot < 0) slot = i;
+    }
+    if (slot < 0) return VK_NULL_HANDLE;
+    g_amphora_fence_devs[slot].host_device = device->host.device;
+    if (!device->p_vkCreateSemaphore || !device->p_vkGetSemaphoreFdKHR)
+        res = VK_ERROR_EXTENSION_NOT_PRESENT;
+    else
+        res = device->p_vkCreateSemaphore( device->host.device, &create_info, NULL, &g_amphora_fence_devs[slot].sem );
+    g_amphora_fence_devs[slot].failed = res != VK_SUCCESS;
+    ERR( "amphora present fence: SYNC_FD semaphore res=%d%s\n", (int)res,
+         res ? " — present falls back to QueueWaitIdle" : "" );
+    return res ? VK_NULL_HANDLE : g_amphora_fence_devs[slot].sem;
+}
+
+/* Caller holds g_amphora_fence_lock. TRUE with *fd = -1 means already signalled. */
+static BOOL amphora_export_present_fd( struct vulkan_device *device, VkSemaphore sem, int *fd )
+{
+    VkSemaphoreGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = sem,
+                                    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+    VkResult res;
+    int i;
+    *fd = -1;
+    if (!(res = device->p_vkGetSemaphoreFdKHR( device->host.device, &info, fd ))) return TRUE;
+    *fd = -1;
+    ERR( "amphora present fence: SYNC_FD export failed res=%d — falling back to QueueWaitIdle\n", (int)res );
+    for (i = 0; i < AMPHORA_FENCE_DEVICES; i++)
+        if (g_amphora_fence_devs[i].host_device == device->host.device) g_amphora_fence_devs[i].failed = TRUE;
+    return FALSE;
+}
+
+static void amphora_forget_device( struct vulkan_device *device )
+{
+    int i;
+    pthread_mutex_lock( &g_amphora_fence_lock );
+    for (i = 0; i < AMPHORA_FENCE_DEVICES; i++)
+    {
+        if (g_amphora_fence_devs[i].host_device != device->host.device) continue;
+        if (g_amphora_fence_devs[i].sem) device->p_vkDestroySemaphore( device->host.device, g_amphora_fence_devs[i].sem, NULL );
+        memset( &g_amphora_fence_devs[i], 0, sizeof(g_amphora_fence_devs[i]) );
+    }
+    pthread_mutex_unlock( &g_amphora_fence_lock );
 }
 
 
@@ -1000,6 +1087,20 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         }
         else
             ERR( "amphora: %s not advertised by ICD — AHB import will fail props=0\n", ahb_ext );
+        /* SYNC_FD semaphore export for the present fence (Android requires it). */
+        {
+            static const char *fence_exts[] = { "VK_KHR_external_semaphore", "VK_KHR_external_semaphore_fd" };
+            for (di = 0; di < (int)(sizeof(fence_exts)/sizeof(fence_exts[0])); di++)
+            {
+                int already = 0, found = 0;
+                for (i = 0; i < count; i++)
+                    if (extensions[i] && !strcmp( extensions[i], fence_exts[di] )) { already = 1; break; }
+                for (i = 0; !already && props && i < n; i++)
+                    if (!strcmp( props[i].extensionName, fence_exts[di] )) { found = 1; break; }
+                if (found) extensions[count++] = fence_exts[di];
+                else if (!already) ERR( "amphora: %s not advertised — present falls back to QueueWaitIdle\n", fence_exts[di] );
+            }
+        }
     }
 
     TRACE( "Enabling %u host device extensions\n", count );
@@ -1156,6 +1257,7 @@ static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCa
 
     if (!device) return;
 
+    amphora_forget_device( device );
     device->p_vkDestroyDevice( device->host.device, NULL /* pAllocator */ );
     for (i = 0; i < device->queue_count; i++)
         instance->p_remove_object( instance, &device->queues[i].obj );
@@ -3159,6 +3261,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct mempool pool = {0};
     uint32_t blit_count = 0;
     VkSemaphore blit_sema;
+    BOOL present_fenced = FALSE; /* Amphora: render-done sync fd replaces QueueWaitIdle */
+    int present_fd = -1;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
@@ -3242,6 +3346,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         VkPipelineStageFlags stages[8];
         uint32_t n = present_info->waitSemaphoreCount, i;
         VkFence host_fence = VK_NULL_HANDLE;
+        VkSemaphore done_sem;
         const VkBaseInStructure *hdr;
         for (hdr = (const VkBaseInStructure *)present_info->pNext; hdr; hdr = hdr->pNext)
         {
@@ -3265,19 +3370,33 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             si.pWaitDstStageMask = stages;
         }
         amphora_flush_pending_acquire( device, queue->host.queue );
-        if (n || host_fence)
+        pthread_mutex_lock( &g_amphora_fence_lock );
+        if ((done_sem = amphora_present_semaphore( device )))
         {
-            VkResult pr = device->p_vkQueueSubmit( queue->host.queue, 1, &si, host_fence );
-            ERR( "amphora present wait+fence res=%d waits=%u fence=%p\n",
-                 (int)pr, n, (void *)(UINT_PTR)host_fence );
+            /* Signalled once the waits and all earlier work on this queue finish. */
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &done_sem;
         }
-        if (device->p_vkQueueWaitIdle)
+        if (n || host_fence || done_sem)
+        {
+            static unsigned int present_n;
+            VkResult pr = device->p_vkQueueSubmit( queue->host.queue, 1, &si, host_fence );
+            if (!pr && done_sem) present_fenced = amphora_export_present_fd( device, done_sem, &present_fd );
+            if (pr || amphora_log_sample( &present_n ))
+                ERR( "amphora present wait+fence res=%d waits=%u fence=%p sync_fd=%d fenced=%d n=%u\n",
+                     (int)pr, n, (void *)(UINT_PTR)host_fence, present_fd, present_fenced, present_n );
+        }
+        pthread_mutex_unlock( &g_amphora_fence_lock );
+        if (!present_fenced && device->p_vkQueueWaitIdle)
             device->p_vkQueueWaitIdle( queue->host.queue );
         present_info->waitSemaphoreCount = 0;
         present_info->pWaitSemaphores = NULL;
     }
     pthread_mutex_lock( &lock );
-    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    if (present_fenced)
+        res = g_amphora_present_fence( queue->host.queue, present_info, present_fd );
+    else
+        res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
     pthread_mutex_unlock( &lock );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
