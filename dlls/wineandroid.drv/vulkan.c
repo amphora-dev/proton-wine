@@ -354,7 +354,9 @@ enum {
     AMPHORA_SC_OP_PRESENT = 5,
     AMPHORA_SC_OP_STASH = 6,
     AMPHORA_SC_OP_PRESENT_FENCE = 7, /* PRESENT + int32 render-done sync fd */
+    AMPHORA_SC_OP_ACQUIRE_IMPORT = 8, /* ACQUIRE; reply adds uint32 handled */
 };
+enum { AMPHORA_ACQ_SEM = 1, AMPHORA_ACQ_FENCE = 2 };
 
 static int amphora_sc_connect(void)
 {
@@ -547,10 +549,13 @@ VkResult amphora_wine_vkAcquireNextImageKHR( VkDevice device, VkSwapchainKHR swa
                                              VkSemaphore semaphore, VkFence fence, uint32_t *index )
 {
     int fd;
-    int32_t op = AMPHORA_SC_OP_ACQUIRE, ret;
+    /* op 8: libamphora_wsi imports the compositor release fence into the
+     * semaphore / fence (SYNC_FD) and reports which it signalled. Only the rest
+     * falls back to win32u's deferred empty submit. */
+    int32_t op = AMPHORA_SC_OP_ACQUIRE_IMPORT, ret;
     uint64_t d = (uint64_t)(UINT_PTR)device, sc = (uint64_t)(UINT_PTR)swapchain;
     uint64_t to = timeout, sem = (uint64_t)(UINT_PTR)semaphore, fen = (uint64_t)(UINT_PTR)fence;
-    uint32_t idx = 0;
+    uint32_t idx = 0, handled = 0;
     if (!index) return VK_ERROR_INITIALIZATION_FAILED;
     fd = amphora_sc_connect();
     if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
@@ -561,7 +566,8 @@ VkResult amphora_wine_vkAcquireNextImageKHR( VkDevice device, VkSwapchainKHR swa
         amphora_sc_io_write( fd, &sem, sizeof(sem) ) ||
         amphora_sc_io_write( fd, &fen, sizeof(fen) ) ||
         amphora_sc_io_read( fd, &ret, sizeof(ret) ) ||
-        amphora_sc_io_read( fd, &idx, sizeof(idx) ))
+        amphora_sc_io_read( fd, &idx, sizeof(idx) ) ||
+        amphora_sc_io_read( fd, &handled, sizeof(handled) ))
     {
         close( fd );
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -569,7 +575,11 @@ VkResult amphora_wine_vkAcquireNextImageKHR( VkDevice device, VkSwapchainKHR swa
     close( fd );
     *index = idx;
     if (ret == VK_SUCCESS)
-        amphora_note_acquire_signal( semaphore, fence );
+    {
+        VkSemaphore left_sem = (handled & AMPHORA_ACQ_SEM) ? VK_NULL_HANDLE : semaphore;
+        VkFence left_fence = (handled & AMPHORA_ACQ_FENCE) ? VK_NULL_HANDLE : fence;
+        if (left_sem || left_fence) amphora_note_acquire_signal( left_sem, left_fence );
+    }
     return (VkResult)ret;
 }
 

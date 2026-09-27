@@ -1087,9 +1087,11 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         }
         else
             ERR( "amphora: %s not advertised by ICD — AHB import will fail props=0\n", ahb_ext );
-        /* SYNC_FD semaphore export for the present fence (Android requires it). */
+        /* SYNC_FD semaphore export for the present fence, and SYNC_FD
+         * semaphore / fence import for the acquire (Android requires both). */
         {
-            static const char *fence_exts[] = { "VK_KHR_external_semaphore", "VK_KHR_external_semaphore_fd" };
+            static const char *fence_exts[] = { "VK_KHR_external_semaphore", "VK_KHR_external_semaphore_fd",
+                                                "VK_KHR_external_fence", "VK_KHR_external_fence_fd" };
             for (di = 0; di < (int)(sizeof(fence_exts)/sizeof(fence_exts[0])); di++)
             {
                 int already = 0, found = 0;
