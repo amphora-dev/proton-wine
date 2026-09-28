@@ -2099,6 +2099,7 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
 
 static BOOL window_clip_client_surfaces( HWND hwnd )
 {
+    const char *amphora = getenv( "AMPHORA_WINEANDROID" );
     WND *win = get_win_ptr( hwnd );
     RECT win_rect;
     BOOL ret;
@@ -2107,6 +2108,13 @@ static BOOL window_clip_client_surfaces( HWND hwnd )
     ret = win->clip_clients;
     win_rect = win->rects.window;
     release_win_ptr( win );
+
+    /* Amphora wineandroid host: dropping the window surface leaves the frame
+     * and child windows of a Vulkan/GL window nothing to paint into (unlike
+     * winex11, GDI cannot draw straight to the native window). Keep it; the
+     * client area is still left out of GDI painting (SET_WINPOS_PIXEL_FORMAT)
+     * and the client surface sits above it. */
+    if (ret && amphora && amphora[0] == '1' && !amphora[1]) return FALSE;
 
     if (ret) return !force_present_to_surface( &win_rect );
 
