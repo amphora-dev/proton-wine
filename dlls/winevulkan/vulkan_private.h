@@ -21,6 +21,7 @@
 #define __WINE_VULKAN_PRIVATE_H
 
 #include <pthread.h>
+#include <string.h>
 
 #include "vulkan_loader.h"
 #include "vulkan_thunks.h"
@@ -81,18 +82,24 @@ static inline void free_conversion_context(struct conversion_context *pool)
         free(entry);
 }
 
+/* Host copies of client structs are filled member by member, so zero them
+ * first: the Adreno driver rejects vkCreateDevice with FEATURE_NOT_PRESENT
+ * when the tail padding of VkPhysicalDeviceVulkan13Features (15 VkBool32
+ * members, 80 bytes) is non-zero, which is what stack garbage left there for
+ * WoW64 DXVK on Adreno 830. */
 static inline void *conversion_context_alloc(struct conversion_context *pool, size_t size)
 {
     if (pool->used + size <= sizeof(pool->buffer))
     {
         void *ret = pool->buffer + pool->used;
         pool->used += (size + sizeof(UINT64) - 1) & ~(sizeof(UINT64) - 1);
+        memset(ret, 0, size);
         return ret;
     }
     else
     {
         struct list *entry;
-        if (!(entry = malloc(sizeof(*entry) + size)))
+        if (!(entry = calloc(1, sizeof(*entry) + size)))
             return NULL;
         list_add_tail(&pool->alloc_entries, entry);
         return entry + 1;
