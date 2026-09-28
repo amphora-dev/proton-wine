@@ -116,7 +116,15 @@ PFN_vkVoidFunction WINAPI vkGetInstanceProcAddr(VkInstance instance, const char 
     }
 
     if (!is_available_instance_function(instance, name))
+    {
+        /* The Khronos loader hands out a trampoline for every physical-device
+         * function it knows, whether the ICD implements it or not (calling one
+         * the device lacks aborts), and vkd3d-proton requires
+         * vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR at instance creation.
+         * The Android loader returns NULL instead; behave like Khronos. */
+        if ((func = wine_vk_get_phys_dev_proc_addr(name))) return func;
         return NULL;
+    }
 
     func = wine_vk_get_instance_proc_addr(name);
     if (func) return func;
