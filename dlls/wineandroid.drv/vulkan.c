@@ -355,6 +355,8 @@ enum {
     AMPHORA_SC_OP_STASH = 6,
     AMPHORA_SC_OP_PRESENT_FENCE = 7, /* PRESENT + int32 render-done sync fd */
     AMPHORA_SC_OP_ACQUIRE_IMPORT = 8, /* ACQUIRE; reply adds uint32 handled */
+    /* uint64 host surface; reply int32 ret, uint32 count, count x uint32 mode */
+    AMPHORA_SC_OP_PRESENT_MODES = 9,
 };
 enum { AMPHORA_ACQ_SEM = 1, AMPHORA_ACQ_FENCE = 2 };
 
@@ -430,6 +432,54 @@ void amphora_wine_vkStashDevice( VkDevice device, VkPhysicalDevice phys )
         amphora_sc_io_read( fd, &ret, sizeof(ret) ))
         ERR( "amphora sc stash ipc failed\n" );
     close( fd );
+}
+
+/* Present modes the AHB swapchain (amphora_ahb_sc in libamphora_wsi) implements
+ * for this host surface. *count is the capacity of modes on input and the number
+ * written on output. VK_ERROR_SURFACE_LOST_KHR: not an AHB-swapchain surface;
+ * VK_ERROR_INITIALIZATION_FAILED: no Amphora host or IPC failed (e.g. an APK
+ * without op 9). */
+__attribute__((visibility("default")))
+VkResult amphora_wine_vkGetSurfacePresentModes( VkSurfaceKHR surface, uint32_t *count, VkPresentModeKHR *modes )
+{
+    static int logged;
+    int fd;
+    int32_t op = AMPHORA_SC_OP_PRESENT_MODES, ret = 0;
+    uint64_t s = (uint64_t)(UINT_PTR)surface;
+    uint32_t n = 0, i, mode;
+
+    if (!count || !modes || !amphora_host_mode()) return VK_ERROR_INITIALIZATION_FAILED;
+    fd = amphora_sc_connect();
+    if (fd < 0) return VK_ERROR_INITIALIZATION_FAILED;
+    if (amphora_sc_io_write( fd, &op, sizeof(op) ) ||
+        amphora_sc_io_write( fd, &s, sizeof(s) ) ||
+        amphora_sc_io_read( fd, &ret, sizeof(ret) ) ||
+        amphora_sc_io_read( fd, &n, sizeof(n) ) ||
+        n > 16)
+    {
+        ERR( "amphora sc present modes ipc failed\n" );
+        close( fd );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    for (i = 0; i < n; i++)
+    {
+        if (amphora_sc_io_read( fd, &mode, sizeof(mode) ))
+        {
+            ERR( "amphora sc present modes ipc failed\n" );
+            close( fd );
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (i < *count) modes[i] = (VkPresentModeKHR)mode;
+    }
+    close( fd );
+    if (ret) return (VkResult)ret;
+    if (n < *count) *count = n;
+    if (!logged)
+    {
+        logged = 1;
+        ERR( "amphora present modes n=%u (AHB swapchain)\n", n );
+    }
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))
