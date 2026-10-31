@@ -332,6 +332,14 @@ static void ANDROID_map_device_extensions( struct vulkan_device_extensions *exte
     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
     /* Host Android loader provides swapchain under the same name. */
     extensions->has_VK_KHR_swapchain = 1;
+    /* Amphora swapchains are the AHB swapchain in libamphora_wsi, which has no
+     * present wait. vkWaitForPresentKHR would hand its handle to the host ICD
+     * (DXVK 3 calls it for FIFO swapchains and asserts on the failure). */
+    if (amphora_host_mode())
+    {
+        extensions->has_VK_KHR_present_wait = 0;
+        extensions->has_VK_KHR_present_wait2 = 0;
+    }
 }
 
 static const struct vulkan_driver_funcs android_vulkan_driver_funcs =
