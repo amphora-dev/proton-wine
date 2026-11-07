@@ -2022,6 +2022,40 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
 }
 
 
+#ifdef __ANDROID__
+/***********************************************************************
+ *           remap_anon_exec
+ *
+ * SELinux does not let an Android app make a written private file mapping
+ * executable (execmod); relocated PE sections hit this. Copy the pages to
+ * anonymous memory, which the app may make executable, and move the copy
+ * over the original with one mremap() so that other threads never see the
+ * range unmapped or zeroed.
+ */
+static int remap_anon_exec( void *base, size_t size, int unix_prot )
+{
+    void *copy;
+    int err;
+
+    /* the pages may not be readable yet (e.g. PAGE_NOACCESS -> PAGE_EXECUTE_READ);
+     * use the requested protection without exec, which SELinux allows */
+    if (mprotect( base, size, (unix_prot & ~PROT_EXEC) | PROT_READ )) return -1;
+    copy = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+    if (copy == MAP_FAILED) return -1;
+    memcpy( copy, base, size );
+    if (!mprotect( copy, size, unix_prot ) &&
+        mremap( copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, base ) != MAP_FAILED)
+    {
+        WARN( "moved %p-%p to anonymous memory to make it executable\n", base, (char *)base + size - 1 );
+        return 0;
+    }
+    err = errno;
+    munmap( copy, size );
+    errno = err;
+    return -1;
+}
+#endif
+
 /***********************************************************************
  *           mprotect_exec
  *
@@ -2037,7 +2071,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         if (!(unix_prot & PROT_WRITE)) return -1;
     }
 
+#ifdef __ANDROID__
+    if (!mprotect( base, size, unix_prot )) return 0;
+    if ((unix_prot & PROT_EXEC) && errno == EACCES) return remap_anon_exec( base, size, unix_prot );
+    return -1;
+#else
     return mprotect( base, size, unix_prot );
+#endif
 }
 
 
