@@ -61,6 +61,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(fsync);
 #include "poppack.h"
 
 int fsync_enabled;
+
+#ifdef __ANDROID__
+/* Bionic has no POSIX shared memory. fsync stays off on Android until it
+ * shares its memory through an fd passed by the server instead of a name. */
+static inline int shm_open( const char *name, int flags, mode_t mode ) { errno = ENOSYS; return -1; }
+static inline int shm_unlink( const char *name ) { errno = ENOSYS; return -1; }
+#endif
 static int current_pid;
 
 /* futex_waitv interface */
