@@ -1628,8 +1628,9 @@ static void fd_destroy( struct object *obj )
 
 /* check if the desired access is possible without violating */
 /* the sharing mode of other opens of the same file */
-static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned int sharing,
-                                   unsigned int open_flags, unsigned int options )
+static unsigned int check_inode_sharing( struct inode *inode, struct fd *fd, unsigned int access,
+                                         unsigned int sharing, unsigned int open_flags,
+                                         unsigned int options )
 {
     /* only a few access bits are meaningful wrt sharing */
     const unsigned int read_access = FILE_READ_DATA | FILE_EXECUTE;
@@ -1640,10 +1641,7 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
     unsigned int existing_access = 0;
     struct fd *fd_ptr;
 
-    fd->access = access;
-    fd->sharing = sharing;
-
-    LIST_FOR_EACH_ENTRY( fd_ptr, &fd->inode->open, struct fd, inode_entry )
+    LIST_FOR_EACH_ENTRY( fd_ptr, &inode->open, struct fd, inode_entry )
     {
         if (fd_ptr == fd) continue;
         /* if access mode is 0, sharing mode is ignored */
@@ -1669,6 +1667,14 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
         ((existing_access & DELETE) && !(sharing & FILE_SHARE_DELETE)))
         return STATUS_SHARING_VIOLATION;
     return 0;
+}
+
+static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned int sharing,
+                                   unsigned int open_flags, unsigned int options )
+{
+    fd->access = access;
+    fd->sharing = sharing;
+    return check_inode_sharing( fd->inode, fd, access, sharing, open_flags, options );
 }
 
 /* set the events that select waits for on this fd */
@@ -1927,6 +1933,179 @@ void get_nt_name( struct fd *fd, struct unicode_str *name )
     name->len = fd->nt_namelen;
 }
 
+/* Shared file store (thin prefixes).
+ *
+ * When WINE_COW_STORE names a directory, prefix files may be symlinks to
+ * read-only files inside it, shared by many prefixes. Before a file is opened
+ * for anything that could modify it (data, attributes, security, deletion or
+ * renaming), the link is replaced by the prefix's own copy, so the change never
+ * reaches the store or other prefixes. Opening for read or execute keeps the
+ * link and the shared page cache.
+ *
+ * The copy is made only once the open is known to pass the sharing checks
+ * against handles already open on the shared file through this prefix (they
+ * would not see the new file), and it keeps the contents, times and user
+ * xattrs (DOS attributes, security descriptor) of the store file, so a link
+ * and its copy look the same to Windows code. Handles opened before the copy
+ * keep reading the store file. */
+static char *cow_store;      /* store directory with a trailing slash, or "" if unused */
+static size_t cow_store_len;
+
+static int cow_store_init(void)
+{
+    const char *env;
+    char *dir;
+
+    if (cow_store) return cow_store_len != 0;
+    cow_store = (char *)"";
+    if (!(env = getenv( "WINE_COW_STORE" )) || !*env || !(dir = realpath( env, NULL ))) return 0;
+    if (!(cow_store = malloc( strlen( dir ) + 2 ))) { free( dir ); cow_store = (char *)""; return 0; }
+    sprintf( cow_store, "%s/", dir );
+    cow_store_len = strlen( cow_store );
+    free( dir );
+    return 1;
+}
+
+/* return the store file a prefix path links to, or NULL; *st is its stat */
+static char *cow_store_target( const char *name, struct stat *st )
+{
+    char *target;
+
+    if (!cow_store_init()) return NULL;
+    if (lstat( name, st ) == -1 || !S_ISLNK( st->st_mode )) return NULL;
+    if (!(target = realpath( name, NULL ))) return NULL;
+    if (strncmp( target, cow_store, cow_store_len ) || stat( target, st ) == -1 || !S_ISREG( st->st_mode ))
+    {
+        free( target );
+        return NULL;
+    }
+    return target;
+}
+
+/* run the sharing checks of an open against the handles open on the store file */
+static unsigned int cow_check_sharing( const struct stat *st, int unix_fd, unsigned int access,
+                                       unsigned int sharing, int flags, unsigned int options )
+{
+    struct inode *inode;
+    unsigned int ret;
+
+    if (!(inode = get_inode( st->st_dev, st->st_ino, unix_fd ))) return get_error();
+    ret = check_inode_sharing( inode, NULL, access, sharing, flags, options );
+    release_object( inode );
+    return ret;
+}
+
+static int cow_copy_data( int in, int out )
+{
+    char buffer[65536];
+    ssize_t len, done, ret;
+
+    while ((len = read( in, buffer, sizeof(buffer) )))
+    {
+        if (len == -1)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        for (done = 0; done < len; done += ret)
+        {
+            if ((ret = write( out, buffer + done, len - done )) == -1)
+            {
+                if (errno == EINTR) { ret = 0; continue; }
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void cow_copy_xattrs( int in, int out )
+{
+#if defined(HAVE_SYS_XATTR_H) && defined(__linux__)
+    char names[4096], value[65536], *name;
+    ssize_t len, size;
+
+    if ((len = flistxattr( in, names, sizeof(names) )) <= 0) return;
+    for (name = names; name < names + len; name += strlen( name ) + 1)
+    {
+        if (strncmp( name, "user.", 5 )) continue;
+        if ((size = fgetxattr( in, name, value, sizeof(value) )) < 0) continue;
+        fsetxattr( out, name, value, size, 0 );
+    }
+#endif
+}
+
+/* replace the store link 'name' by a private copy of 'target' (empty if
+ * truncating); returns -1 with errno set on failure, leaving the link alone */
+static int cow_break_link( const char *name, const char *target, const struct stat *st, int truncate )
+{
+    struct timespec times[2];
+    char *tmp;
+    int in = -1, out = -1, ret = -1, err;
+
+    if (!(tmp = malloc( strlen( name ) + sizeof(".wine-cow") ))) return -1;
+    sprintf( tmp, "%s.wine-cow", name );
+    if ((out = open( tmp, O_WRONLY | O_CREAT | O_EXCL, (st->st_mode & 0777) | 0600 )) == -1 && errno == EEXIST)
+    {
+        unlink( tmp );  /* left over from an interrupted copy */
+        out = open( tmp, O_WRONLY | O_CREAT | O_EXCL, (st->st_mode & 0777) | 0600 );
+    }
+    if (out == -1) goto done;
+    if ((in = open( target, O_RDONLY )) == -1) goto done;
+    if (!truncate && cow_copy_data( in, out ) == -1) goto done;
+    cow_copy_xattrs( in, out );
+    if (!truncate)
+    {
+        times[0] = st->st_atim;
+        times[1] = st->st_mtim;
+        futimens( out, times );
+    }
+    if (fsync( out ) == -1) goto done;
+    if (close( out ) == -1) { out = -1; goto done; }
+    out = -1;
+    if (rename( tmp, name ) == -1) goto done;
+    ret = 0;
+
+done:
+    err = errno;
+    if (out != -1) close( out );
+    if (in != -1) close( in );
+    if (ret == -1) unlink( tmp );
+    free( tmp );
+    errno = err;
+    return ret;
+}
+
+/* copy-on-write for an open of 'name'; returns 0 or an NTSTATUS for the open */
+static unsigned int cow_prepare_open( const char *name, int flags, unsigned int access,
+                                      unsigned int sharing, unsigned int options )
+{
+    struct stat st;
+    unsigned int status;
+    char *target;
+    int unix_fd;
+
+    if (options & FILE_DIRECTORY_FILE) return 0;
+    if (!(access & (FILE_UNIX_WRITE_ACCESS | DELETE | WRITE_DAC | WRITE_OWNER)) && !(flags & O_TRUNC)) return 0;
+    if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) return 0;  /* fails on the existing link */
+    if (!(target = cow_store_target( name, &st ))) return 0;
+
+    if ((unix_fd = open( target, O_RDONLY )) == -1)
+    {
+        free( target );
+        return 0;  /* let the real open report it */
+    }
+    status = cow_check_sharing( &st, unix_fd, access, sharing, flags, options );
+    close( unix_fd );
+    if (!status && cow_break_link( name, target, &st, flags & O_TRUNC ) == -1)
+    {
+        file_set_error();
+        status = get_error();
+    }
+    free( target );
+    return status;
+}
+
 /* open() wrapper that returns a struct fd with no fd user set */
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
                     int flags, mode_t *mode, unsigned int access,
@@ -1935,6 +2114,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     struct stat st;
     struct closed_fd *closed_fd;
     struct fd *fd;
+    unsigned int cow_status;
     int root_fd = -1;
     int rw_mode;
     char *path;
@@ -1978,6 +2158,12 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             }
         }
         flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+    }
+
+    if ((cow_status = cow_prepare_open( name, flags, access, sharing, options )))
+    {
+        set_error( cow_status );
+        goto error;
     }
 
     if ((access & FILE_UNIX_WRITE_ACCESS) && !(options & FILE_DIRECTORY_FILE))
