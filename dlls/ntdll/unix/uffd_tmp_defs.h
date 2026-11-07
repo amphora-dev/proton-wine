@@ -3,10 +3,14 @@
 
 #define UFFD_USER_MODE_ONLY 1
 
-#ifdef __x86_64__
+#ifndef __NR_userfaultfd
+#if defined(__x86_64__)
 #define __NR_userfaultfd 323
-#else
+#elif defined(__i386__)
 #define __NR_userfaultfd 374
+#elif defined(__aarch64__)
+#define __NR_userfaultfd 282
+#endif
 #endif
 
 #ifndef UFFD_FEATURE_WP_ASYNC
