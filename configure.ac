@@ -2140,6 +2140,12 @@ dnl **** Platform-specific checks ****
 AC_SUBST(WINELOADER_PROGRAMS,"wine")
 
 case $host_os in
+  linux-android*)
+    dnl Apps targeting Android 10 (API 29) or later cannot execve() files in their
+    dnl data directory, so they run them through the system dynamic linker, which
+    dnl cannot load the static preloader. On 64-bit, ntdll reserves the same areas
+    dnl at startup when there is no preloader (mmap_init).
+    ;;
   linux*)
     if test $HOST_ARCH != unknown
     then
