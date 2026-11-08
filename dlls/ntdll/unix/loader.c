@@ -248,13 +248,116 @@ static char *build_relative_path( const char *base, const char *from, const char
     return ret;
 }
 
+#if defined(__ANDROID__) && defined(HAVE_ELF_H) && (defined(__aarch64__) || defined(__x86_64__))
+
+/* Apps targeting Android 10 (API 29) or later may not execve() files in their
+ * data directory (SELinux W^X), but the system dynamic linker can run them:
+ * "linker64 /path/prog args..." loads prog and runs it with argv[0] = path. */
+static const char android_linker[] = "/system/bin/linker64";
+
+#ifdef __aarch64__
+#define ANDROID_ELF_MACHINE EM_AARCH64
+#else
+#define ANDROID_ELF_MACHINE EM_X86_64
+#endif
+
+static BOOL needs_android_linker( const char *path )
+{
+    static const char * const system_dirs[] =
+        { "/system/", "/system_ext/", "/vendor/", "/product/", "/odm/", "/apex/" };
+    Elf64_Ehdr ehdr;
+    unsigned int i;
+    ssize_t len;
+    int fd;
+
+    for (i = 0; i < ARRAY_SIZE(system_dirs); i++)
+        if (!strncmp( path, system_dirs[i], strlen( system_dirs[i] ))) return FALSE;
+
+    if ((fd = open( path, O_RDONLY | O_CLOEXEC )) == -1) return FALSE;
+    len = pread( fd, &ehdr, sizeof(ehdr), 0 );
+    close( fd );
+    /* the linker only loads position-independent native executables */
+    return len == sizeof(ehdr) && !memcmp( ehdr.e_ident, ELFMAG, SELFMAG ) &&
+           ehdr.e_ident[EI_CLASS] == ELFCLASS64 && ehdr.e_machine == ANDROID_ELF_MACHINE &&
+           ehdr.e_type == ET_DYN;
+}
+
+static size_t argv_count( char *const argv[] )
+{
+    size_t count = 0;
+    while (argv[count]) count++;
+    return count;
+}
+
+/* fill "linker64 path argv[1]... NULL" into count + 3 entries; the program
+ * gets path as argv[0]. No allocation: this runs in forked children. */
+static void make_linker_argv( char **linker_argv, const char *path, char *const argv[], size_t count )
+{
+    size_t i;
+
+    linker_argv[0] = (char *)android_linker;
+    linker_argv[1] = (char *)path;
+    for (i = 1; i < count; i++) linker_argv[i + 1] = argv[i];
+    linker_argv[i + 1] = NULL;
+}
+
+#define USE_ANDROID_LINKER
+#endif
+
+
+/***********************************************************************
+ *           unix_execv
+ *
+ * execv() that also runs app-private executables on Android.
+ */
+int unix_execv( const char *path, char *const argv[] )
+{
+#ifdef USE_ANDROID_LINKER
+    if (needs_android_linker( path ))
+    {
+        size_t count = argv_count( argv );
+        char *linker_argv[count + 3];
+
+        make_linker_argv( linker_argv, path, argv, count );
+        return execv( android_linker, linker_argv );
+    }
+#endif
+    return execv( path, argv );
+}
+
+
+/***********************************************************************
+ *           unix_spawn
+ *
+ * posix_spawn() with the current environment that also runs app-private
+ * executables on Android. Returns 0 or an errno value.
+ */
+int unix_spawn( pid_t *pid, const char *path, char *const argv[] )
+{
+#ifdef USE_ANDROID_LINKER
+    if (needs_android_linker( path ))
+    {
+        size_t count = argv_count( argv );
+        char *linker_argv[count + 3];
+
+        make_linker_argv( linker_argv, path, argv, count );
+        return posix_spawn( pid, android_linker, NULL, NULL, linker_argv, environ );
+    }
+    /* Bionic's posix_spawn() succeeds even when the exec fails; report a
+     * missing file so that callers trying several locations move on. */
+    if (access( path, X_OK )) return errno;
+#endif
+    return posix_spawn( pid, path, NULL, NULL, argv, environ );
+}
+
+
 /* build a path to a binary and exec it */
 static int build_path_and_exec( pid_t *pid, const char *dir, const char *name, char **argv )
 {
     int ret;
 
     argv[0] = build_path( dir, name );
-    ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
+    ret = unix_spawn( pid, argv[0], argv );
     free( argv[0] );
     return ret;
 }
@@ -510,7 +613,7 @@ static void preloader_exec( char **argv, WORD machine )
     execv( argv[0], argv );
     free( argv[0] );
 #endif
-    execv( argv[1], argv + 1 );
+    unix_execv( argv[1], argv + 1 );
 }
 
 /* exec the appropriate wine loader for the specified machine */

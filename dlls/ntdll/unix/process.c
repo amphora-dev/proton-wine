@@ -465,6 +465,14 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 }
 
 
+/* exec argv[0], searching PATH when it has no directory part */
+static void exec_argv( char * const argv[] )
+{
+    if (strchr( argv[0], '/' )) unix_execv( argv[0], argv );
+    else execvp( argv[0], argv );
+}
+
+
 /***********************************************************************
  *           __wine_unix_spawnvp
  */
@@ -489,10 +497,10 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
         signal( SIGPIPE, SIG_DFL );
         if (!wait)
         {
-            if (!(pid = fork())) execvp( argv[0], argv ); /* in grandchild */
+            if (!(pid = fork())) exec_argv( argv ); /* in grandchild */
             if (pid > 0) _exit(0); /* exit child if fork succeeded */
         }
-        else execvp( argv[0], argv );
+        else exec_argv( argv );
 
         err = errno_to_status( errno );
         write( fd[1], &err, sizeof(err) );
@@ -614,7 +622,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
                 fchdir( unixdir );
                 close( unixdir );
             }
-            execv( unix_name, argv );
+            unix_execv( unix_name, argv );
         }
 
         if (pid <= 0)  /* grandchild if exec failed or child if fork failed */

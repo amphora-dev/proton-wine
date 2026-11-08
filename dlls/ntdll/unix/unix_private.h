@@ -232,6 +232,8 @@ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );
 extern char *get_alternate_wineloader( WORD machine );
+extern int unix_execv( const char *path, char *const argv[] );
+extern int unix_spawn( pid_t *pid, const char *path, char *const argv[] );
 extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
 extern NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
                               ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
