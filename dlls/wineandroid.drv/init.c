@@ -42,8 +42,10 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 
+/* Java peer of the device side. The Amphora SDK provides it (it is not an
+ * Activity there); build with -DWINE_JAVA_CLASS=... for another host. */
 #ifndef WINE_JAVA_CLASS
-#define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
+#define WINE_JAVA_CLASS "app/amphora/sdk/internal/driver/WineDriver"
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(android);
