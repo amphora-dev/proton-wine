@@ -279,7 +279,9 @@ static char *get_nls_dir(void)
 {
     char *p, *dir, *ret;
 
-#if defined(__linux__) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
+    /* On Android, app-private programs run through the system linker, so
+     * /proc/self/exe is the linker; use argv[0] there (the #else branch). */
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
     dir = realpath( "/proc/self/exe", NULL );
 #elif defined (__FreeBSD__) || defined(__DragonFly__)
     static int pathname[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
