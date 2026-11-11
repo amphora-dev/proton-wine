@@ -959,6 +959,13 @@ BOOL ANDROID_CreateWindow( HWND hwnd )
 
         if (!(data = alloc_win_data( hwnd ))) return FALSE;
         release_win_data( data );
+
+        /* Keyboard events carry no window, so the server queues them on the input
+         * desktop, which is the first desktop created in the window station until
+         * a pointer event names a window on another one. The view shows this
+         * desktop, so make it the input desktop from the start. */
+        if (event_source != -1 && !NtUserSwitchDesktop( NtUserGetThreadDesktop( GetCurrentThreadId() ) ))
+            WARN( "failed to make the desktop of %p the input desktop\n", hwnd );
     }
     return TRUE;
 }
