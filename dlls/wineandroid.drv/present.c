@@ -201,7 +201,9 @@ static void presenter_release( struct presenter *presenter )
     free( presenter );
 }
 
-/* Tells the Wine process that an image is free again. Closes the frame's fence. */
+/* Tells the Wine process that an image is free again. Closes the frame's fence. An image is released
+ * once for each time it was presented, so what waits in the socket is bounded by the images there are,
+ * and sending does not block. */
 static void send_release( struct presenter *presenter, struct frame *frame )
 {
     struct present_message msg = { .type = PRESENT_RELEASE, .swapchain = frame->swapchain, .image = frame->image };
@@ -243,12 +245,16 @@ static void transaction_complete( void *context, ASurfaceTransactionStats *stats
     send_release( presenter, &completion->replaced );
 
     pthread_mutex_lock( &presenter->lock );
-    presenter->in_flight = FALSE;
-    if (presenter->waiting.swapchain)
+    /* a transaction on a layer that was replaced since says nothing about the one on the current layer */
+    if (completion->layer == presenter->layer)
     {
-        struct frame frame = presenter->waiting;
-        presenter->waiting = no_frame;
-        submit_frame( presenter, &frame );
+        presenter->in_flight = FALSE;
+        if (presenter->waiting.swapchain)
+        {
+            struct frame frame = presenter->waiting;
+            presenter->waiting = no_frame;
+            submit_frame( presenter, &frame );
+        }
     }
     pthread_mutex_unlock( &presenter->lock );
 
@@ -268,7 +274,8 @@ static void submit_frame( struct presenter *presenter, struct frame *frame )
 
     if (!swapchain || frame->image < 0 || frame->image >= swapchain->count)
     {
-        if (frame->fence >= 0) close( frame->fence );
+        /* nothing to show; whoever sent it must not wait for it forever */
+        send_release( presenter, frame );
         return;
     }
     if (!presenter->layer)
@@ -362,6 +369,7 @@ static int handle_create( struct presenter *presenter, const struct present_mess
         return -1;
     }
 
+    /* each buffer is one packet, sent right behind the message that announced them */
     for (i = 0; i < msg->count; i++)
     {
         if ((ret = pAHardwareBuffer_recvHandleFromUnixSocket( presenter->socket, &swapchain->buffers[i] )))

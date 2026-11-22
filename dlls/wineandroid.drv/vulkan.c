@@ -206,10 +206,13 @@ static BOOL has_name( const char *const *names, uint32_t count, const char *name
 
 /* Extensions */
 
-/* Host instance extensions about its own surfaces; ours are VK_KHR_surface and what win32u derives from it. */
+/* Host instance extensions about its own surfaces; ours are VK_KHR_surface and what win32u derives from it.
+ * A surface the host made would be taken for one of ours. */
 static const char *const hidden_instance_extensions[] =
 {
     "VK_KHR_android_surface",
+    "VK_KHR_display",
+    "VK_EXT_headless_surface",
     "VK_KHR_surface_protected_capabilities",
     "VK_EXT_surface_maintenance1",
     "VK_KHR_surface_maintenance1",
@@ -227,6 +230,7 @@ static const char *const hidden_device_extensions[] =
     "VK_KHR_present_wait2",
     "VK_KHR_incremental_present",
     "VK_KHR_shared_presentable_image",
+    "VK_KHR_display_swapchain",
     "VK_EXT_present_mode_fifo_latest_ready",
     "VK_KHR_present_mode_fifo_latest_ready",
     "VK_EXT_present_timing",
@@ -1063,23 +1067,26 @@ static VkResult acquire_image( struct device *device, struct swapchain *swapchai
                 *index = i;
                 return signal_acquire( device, release_fence, semaphore, fence );
             }
-            pfd.fd = surface->socket;
+            /* our own descriptor: the surface's may be closed, and its number reused, while we wait */
+            if ((pfd.fd = dup( surface->socket )) < 0) res = VK_ERROR_SURFACE_LOST_KHR;
         }
         pthread_mutex_unlock( &surface->lock );
         if (res) return res;
 
         /* every image is with the application or the host: wait for the host to send one back */
-        if (!timeout) return VK_NOT_READY;
-        if (timeout != UINT64_MAX)
+        if (!timeout) res = VK_NOT_READY;
+        else if (timeout != UINT64_MAX)
         {
             uint64_t elapsed;
 
             clock_gettime( CLOCK_MONOTONIC, &now );
             elapsed = (now.tv_sec - start.tv_sec) * (uint64_t)1000000000 + now.tv_nsec - start.tv_nsec;
-            if (elapsed >= timeout) return VK_TIMEOUT;
-            wait = min( (timeout - elapsed + 999999) / 1000000, (uint64_t)INT_MAX );
+            if (elapsed >= timeout) res = VK_TIMEOUT;
+            else wait = min( (timeout - elapsed + 999999) / 1000000, (uint64_t)INT_MAX );
         }
-        if (poll( &pfd, 1, wait ) < 0 && errno != EINTR) return VK_ERROR_SURFACE_LOST_KHR;
+        if (!res && poll( &pfd, 1, wait ) < 0 && errno != EINTR) res = VK_ERROR_SURFACE_LOST_KHR;
+        close( pfd.fd );
+        if (res) return res;
     }
 }
 
