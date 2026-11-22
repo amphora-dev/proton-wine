@@ -2108,6 +2108,11 @@ static BOOL window_clip_client_surfaces( HWND hwnd )
     win_rect = win->rects.window;
     release_win_ptr( win );
 
+#ifdef __ANDROID__
+    /* no window manager draws the frame there: it is in the window surface */
+    return FALSE;
+#endif
+
     if (ret) return !force_present_to_surface( &win_rect );
 
     return ret;
