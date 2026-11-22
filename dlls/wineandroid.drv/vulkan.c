@@ -167,6 +167,7 @@ struct swapchain
     int             id;
     BOOL            retired;           /* replaced by a newer swapchain */
     VkExtent2D      extent;
+    struct timespec next_present;      /* under a frame rate limit: no present before this */
     uint32_t        count;
     struct image    images[PRESENT_MAX_IMAGES];
 };
@@ -320,6 +321,84 @@ static void load_hal_driver( const char *path, PFN_vkGetInstanceProcAddr *instan
     /* in the system log as well: which driver drew is the first question about any picture */
     p__android_log_print( ANDROID_LOG_INFO, "wine", "vulkan: using %s from %s", module->name ? module->name : "?", path );
     TRACE( "using %s (%s) from %s\n", debugstr_a(module->name), debugstr_a(module->author), debugstr_a(path) );
+}
+
+
+/* Frame rate */
+
+/* How often swapchains present is the user's choice before it is the application's. WINE_ANDROID_FRAME_RATE:
+ *   screen      every frame is shown, at the display's pace, whatever present mode the application asks for
+ *   unlimited   only the newest frame is shown and nothing waits for the display, whatever it asks for
+ *   <number>    as screen, with presents at least 1/number seconds apart
+ *   anything else, or not set: the application's present mode decides
+ * The compositor only ever shows whole frames, so none of these tears. */
+enum frame_rate
+{
+    FRAME_RATE_APPLICATION,
+    FRAME_RATE_SCREEN,
+    FRAME_RATE_UNLIMITED,
+    FRAME_RATE_LIMITED,
+};
+
+static enum frame_rate frame_rate;
+static unsigned int frame_rate_limit;   /* frames per second, for FRAME_RATE_LIMITED */
+
+static void init_frame_rate(void)
+{
+    const char *env = getenv( "WINE_ANDROID_FRAME_RATE" );
+    int limit;
+
+    if (!env) return;
+    if (!strcmp( env, "screen" )) frame_rate = FRAME_RATE_SCREEN;
+    else if (!strcmp( env, "unlimited" )) frame_rate = FRAME_RATE_UNLIMITED;
+    else if ((limit = atoi( env )) > 0)
+    {
+        frame_rate = FRAME_RATE_LIMITED;
+        frame_rate_limit = limit;
+    }
+    TRACE( "frame rate %s: mode %d, limit %u\n", debugstr_a(env), frame_rate, frame_rate_limit );
+}
+
+/* Whether a swapchain created with this present mode shows every frame. */
+static BOOL shows_every_frame( VkPresentModeKHR mode )
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+    pthread_once( &once, init_frame_rate );
+    switch (frame_rate)
+    {
+    case FRAME_RATE_SCREEN:
+    case FRAME_RATE_LIMITED:
+        return TRUE;
+    case FRAME_RATE_UNLIMITED:
+        return FALSE;
+    default:
+        return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    }
+}
+
+/* Under a limit, waits until the swapchain may present again. A display mode of that rate would pace the
+ * swapchain by itself; few panels have one for every limit, and a translation layer's own limiter (they have
+ * the same number) leaves nothing to wait for here. */
+static void wait_for_frame_rate( struct swapchain *swapchain )
+{
+    struct timespec now, *next = &swapchain->next_present;
+    long interval;
+
+    if (frame_rate != FRAME_RATE_LIMITED) return;
+    interval = 1000000000 / frame_rate_limit;
+
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    if (now.tv_sec < next->tv_sec || (now.tv_sec == next->tv_sec && now.tv_nsec < next->tv_nsec))
+        while (clock_nanosleep( CLOCK_MONOTONIC, TIMER_ABSTIME, next, NULL ) == EINTR) /* nothing */;
+    else *next = now;   /* late: the next frame is measured from this one, not from where it should have been */
+
+    next->tv_nsec += interval;
+    if (next->tv_nsec >= 1000000000)
+    {
+        next->tv_nsec -= 1000000000;
+        next->tv_sec++;
+    }
 }
 
 
@@ -1061,7 +1140,7 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
     /* Showing only the newest frame takes one image more than the surface's minimum: one on screen
      * until the next takes its place, one with the compositor, one waiting in the host, and one for
      * the application to draw, or it waits for the compositor after all. */
-    fifo = info->presentMode == VK_PRESENT_MODE_FIFO_KHR || info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    fifo = shows_every_frame( info->presentMode );
     swapchain->count = min( max( info->minImageCount, fifo ? 3 : 4 ), PRESENT_MAX_IMAGES );
     for (i = 0; i < swapchain->count && !res; i++) res = create_image( swapchain, &swapchain->images[i], info );
     if (res) goto failed;
@@ -1317,6 +1396,7 @@ static VkResult android_vkQueuePresentKHR( VkQueue queue, const VkPresentInfoKHR
 
     for (i = 0; i < info->swapchainCount; i++)
     {
+        wait_for_frame_rate( swapchain_from_handle( info->pSwapchains[i] ) );
         res = present_image( swapchain_from_handle( info->pSwapchains[i] ), info->pImageIndices[i], fence );
         if (info->pResults) info->pResults[i] = res;
         if (res < 0 && ret >= 0) ret = res;
