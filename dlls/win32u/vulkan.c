@@ -1071,7 +1071,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
             VkPhysicalDeviceMapMemoryPlacedPropertiesEXT map_placed_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
             VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,.pNext = &map_placed_props};
 
-            instance->p_vkGetPhysicalDeviceProperties2( host_physical_device, &props );
+            instance->p_vkGetPhysicalDeviceProperties2KHR( host_physical_device, &props );
             physical_device->map_placed_align = map_placed_props.minPlacedMemoryMapAlignment;
             TRACE( "Using placed map with alignment %u\n", physical_device->map_placed_align );
         }
