@@ -4805,12 +4805,19 @@ static void lazydrv_map_device_extensions( struct vulkan_device_extensions *exte
     return driver_funcs->p_map_device_extensions( extensions );
 }
 
+static void lazydrv_wrap_host_proc_addr( PFN_vkGetInstanceProcAddr *instance_proc_addr, PFN_vkGetDeviceProcAddr *device_proc_addr )
+{
+    vulkan_driver_load();
+    if (driver_funcs->p_wrap_host_proc_addr) driver_funcs->p_wrap_host_proc_addr( instance_proc_addr, device_proc_addr );
+}
+
 static const struct vulkan_driver_funcs lazydrv_funcs =
 {
     .p_vulkan_surface_create = lazydrv_vulkan_surface_create,
     .p_get_physical_device_presentation_support = lazydrv_get_physical_device_presentation_support,
     .p_map_instance_extensions = lazydrv_map_instance_extensions,
     .p_map_device_extensions = lazydrv_map_device_extensions,
+    .p_wrap_host_proc_addr = lazydrv_wrap_host_proc_addr,
 };
 
 static void vulkan_init_once(void)
@@ -4845,6 +4852,8 @@ static void vulkan_init_once(void)
 #undef LOAD_FUNCPTR
 
     driver_funcs = &lazydrv_funcs;
+    /* before anything is looked up: every host function is found through these two */
+    driver_funcs->p_wrap_host_proc_addr( &p_vkGetInstanceProcAddr, &p_vkGetDeviceProcAddr );
     vulkan_funcs.p_vkGetInstanceProcAddr = p_vkGetInstanceProcAddr;
     vulkan_funcs.p_vkGetDeviceProcAddr = p_vkGetDeviceProcAddr;
 
