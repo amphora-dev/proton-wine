@@ -34,6 +34,10 @@
  * win32u finds every host function through vkGetInstanceProcAddr and
  * vkGetDeviceProcAddr; the driver wraps the two and answers for the entry
  * points below, so nothing above it knows the difference.
+ *
+ * The host is the platform's libvulkan.so, or, when WINE_ANDROID_VULKAN_HAL names
+ * one, an Android Vulkan HAL module such as Mesa's Turnip, opened here the
+ * way the platform's loader opens the system's driver (see "Host driver").
  */
 
 #if 0
@@ -44,6 +48,7 @@
 
 #include "config.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdarg.h>
@@ -204,6 +209,120 @@ static BOOL has_name( const char *const *names, uint32_t count, const char *name
 }
 
 
+/* Host driver */
+
+/* An Android Vulkan HAL module is a library whose HMI symbol is a struct hwvulkan_module_t; opening its "vk0"
+ * device gives the three functions a loader starts from. These are the declarations of the platform's
+ * hardware/hardware.h and hardware/hwvulkan.h, which the NDK does not have. */
+
+#define HARDWARE_MODULE_TAG (('H' << 24) | ('W' << 16) | ('M' << 8) | 'T')
+#define HARDWARE_DEVICE_TAG (('H' << 24) | ('W' << 16) | ('D' << 8) | 'T')
+
+struct hw_module;
+
+struct hw_device
+{
+    uint32_t          tag;
+    uint32_t          version;
+    struct hw_module *module;
+    uint64_t          reserved[12];
+    int             (*close)( struct hw_device *device );
+};
+
+struct hw_module_methods
+{
+    int (*open)( const struct hw_module *module, const char *id, struct hw_device **device );
+};
+
+struct hw_module
+{
+    uint32_t                  tag;
+    uint16_t                  module_api_version;
+    uint16_t                  hal_api_version;
+    const char               *id;
+    const char               *name;
+    const char               *author;
+    struct hw_module_methods *methods;
+    void                     *dso;
+    uint64_t                  reserved[32 - 7];
+};
+
+struct hwvulkan_device
+{
+    struct hw_device common;
+    PFN_vkEnumerateInstanceExtensionProperties EnumerateInstanceExtensionProperties;
+    PFN_vkCreateInstance CreateInstance;
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+};
+
+static const struct hw_module *hal_module;          /* the driver in use, when it is not the platform's */
+static PFN_vkGetDeviceProcAddr hal_vkGetDeviceProcAddr;
+
+static PFN_vkVoidFunction hal_get_device_proc_addr( VkDevice device, const char *name )
+{
+    /* devices come from instances, and creating the first one found the function */
+    return hal_vkGetDeviceProcAddr ? hal_vkGetDeviceProcAddr( device, name ) : NULL;
+}
+
+static VkResult no_driver_vkEnumerateInstanceExtensionProperties( const char *layer, uint32_t *count, VkExtensionProperties *props )
+{
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VkResult no_driver_vkCreateInstance( const VkInstanceCreateInfo *create_info, const VkAllocationCallbacks *allocator,
+                                            VkInstance *instance )
+{
+    return VK_ERROR_INCOMPATIBLE_DRIVER;
+}
+
+static PFN_vkVoidFunction no_driver_get_instance_proc_addr( VkInstance instance, const char *name )
+{
+    if (!strcmp( name, "vkEnumerateInstanceExtensionProperties" )) return (PFN_vkVoidFunction)no_driver_vkEnumerateInstanceExtensionProperties;
+    if (!strcmp( name, "vkCreateInstance" )) return (PFN_vkVoidFunction)no_driver_vkCreateInstance;
+    return NULL;
+}
+
+/* Opens the HAL module at path. The driver that was asked for is the only one: when it cannot be used there is
+ * no Vulkan, rather than the platform's driver passing for it. */
+static void load_hal_driver( const char *path, PFN_vkGetInstanceProcAddr *instance_proc_addr, PFN_vkGetDeviceProcAddr *device_proc_addr )
+{
+    const struct hw_module *module;
+    struct hw_device *device;
+    void *handle;
+    int ret;
+
+    *instance_proc_addr = no_driver_get_instance_proc_addr;
+    *device_proc_addr = hal_get_device_proc_addr;
+
+    if (!(handle = dlopen( path, RTLD_NOW | RTLD_LOCAL )))
+    {
+        ERR( "failed to load %s: %s\n", debugstr_a(path), dlerror() );
+        return;
+    }
+    if (!(module = dlsym( handle, "HMI" )) || module->tag != HARDWARE_MODULE_TAG ||
+        !module->id || strcmp( module->id, "vulkan" ) || !module->methods || !module->methods->open)
+    {
+        ERR( "%s is not a Vulkan HAL module\n", debugstr_a(path) );
+        return;
+    }
+    if ((ret = module->methods->open( module, "vk0", &device )) || !device || device->tag != HARDWARE_DEVICE_TAG)
+    {
+        ERR( "failed to open the Vulkan device of %s, error %d\n", debugstr_a(path), ret );
+        return;
+    }
+    if (!(*instance_proc_addr = ((struct hwvulkan_device *)device)->GetInstanceProcAddr))
+    {
+        ERR( "%s has no vkGetInstanceProcAddr\n", debugstr_a(path) );
+        *instance_proc_addr = no_driver_get_instance_proc_addr;
+        return;
+    }
+    hal_module = module;
+    /* in the system log as well: which driver drew is the first question about any picture */
+    p__android_log_print( ANDROID_LOG_INFO, "wine", "vulkan: using %s from %s", module->name ? module->name : "?", path );
+    TRACE( "using %s (%s) from %s\n", debugstr_a(module->name), debugstr_a(module->author), debugstr_a(path) );
+}
+
+
 /* Extensions */
 
 /* Host instance extensions about its own surfaces; ours are VK_KHR_surface and what win32u derives from it.
@@ -217,6 +336,13 @@ static const char *const hidden_instance_extensions[] =
     "VK_EXT_surface_maintenance1",
     "VK_KHR_surface_maintenance1",
     "VK_GOOGLE_surfaceless_query",
+};
+
+/* Ours, whether or not the host has them: the platform's loader does, a driver opened directly does not. */
+static const char *const provided_instance_extensions[] =
+{
+    "VK_KHR_surface",
+    "VK_KHR_get_surface_capabilities2",
 };
 
 /* Host device extensions that work on its swapchains, which ours are not. */
@@ -355,7 +481,7 @@ static VkResult android_vkEnumerateInstanceExtensionProperties( const char *laye
     if (layer) return host_vkEnumerateInstanceExtensionProperties( layer, count, props );
     if ((res = get_host_instance_extensions( &host, &host_count ))) return res;
     res = filter_extensions( host, host_count, hidden_instance_extensions, ARRAY_SIZE(hidden_instance_extensions),
-                             NULL, 0, count, props );
+                             provided_instance_extensions, ARRAY_SIZE(provided_instance_extensions), count, props );
     free( host );
     return res;
 }
@@ -401,7 +527,15 @@ static VkResult android_vkCreateInstance( const VkInstanceCreateInfo *create_inf
         free( host );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    for (i = 0; i < info.enabledExtensionCount; i++) names[count++] = info.ppEnabledExtensionNames[i];
+    for (i = 0; i < info.enabledExtensionCount; i++)
+    {
+        const char *name = info.ppEnabledExtensionNames[i];
+
+        /* a host that has them keeps them on: the types and results of VK_KHR_surface are in use */
+        if (has_name( provided_instance_extensions, ARRAY_SIZE(provided_instance_extensions), name ) &&
+            !has_extension( host, host_count, name )) continue;
+        names[count++] = name;
+    }
     for (i = 0; i < ARRAY_SIZE(dependency_instance_extensions); i++)
     {
         const char *name = dependency_instance_extensions[i];
@@ -413,6 +547,9 @@ static VkResult android_vkCreateInstance( const VkInstanceCreateInfo *create_inf
     res = host_vkCreateInstance( &info, allocator, instance );
     free( names );
     free( host );
+    /* a HAL module has no vkGetDeviceProcAddr to export: it is an instance function like any other */
+    if (!res && hal_module && !hal_vkGetDeviceProcAddr)
+        hal_vkGetDeviceProcAddr = (void *)host_vkGetInstanceProcAddr( *instance, "vkGetDeviceProcAddr" );
     return res;
 }
 
@@ -1288,6 +1425,9 @@ static PFN_vkVoidFunction android_vkGetDeviceProcAddr( VkDevice device, const ch
 
 static void android_wrap_host_proc_addr( PFN_vkGetInstanceProcAddr *instance_proc_addr, PFN_vkGetDeviceProcAddr *device_proc_addr )
 {
+    const char *hal = getenv( "WINE_ANDROID_VULKAN_HAL" );
+
+    if (hal && *hal) load_hal_driver( hal, instance_proc_addr, device_proc_addr );
     host_vkGetInstanceProcAddr = *instance_proc_addr;
     host_vkGetDeviceProcAddr = *device_proc_addr;
     /* the global functions; the others are kept when win32u looks them up for an instance */
