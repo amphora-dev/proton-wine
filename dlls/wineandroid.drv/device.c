@@ -104,6 +104,7 @@ enum android_ioctl
     IOCTL_SET_SWAP_INT,
     IOCTL_SET_CAPTURE,
     IOCTL_SET_CURSOR,
+    IOCTL_PRESENT_CONNECT,
     NB_IOCTLS
 };
 
@@ -244,6 +245,11 @@ struct ioctl_android_set_cursor
     int                 hotspotx;
     int                 hotspoty;
     int                 bits[1];
+};
+
+struct ioctl_android_present_connect
+{
+    struct ioctl_header hdr;
 };
 
 static struct native_win_data *data_map[65536];
@@ -450,6 +456,7 @@ void register_native_window( HWND hwnd, struct ANativeWindow *win, BOOL opengl )
     if (data->api) win->perform( win, NATIVE_WINDOW_API_CONNECT, data->api );
     win->perform( win, NATIVE_WINDOW_SET_BUFFERS_FORMAT, data->buffer_format );
     win->setSwapInterval( win, data->swap_interval );
+    if (opengl) present_surface_changed( hwnd, win );
     LOG( TRACE, "%p -> %p win %p\n", hwnd, data, win );
 end:
     pthread_mutex_unlock(&dispatch_ioctl_lock);
@@ -840,6 +847,21 @@ static int setCursor_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_si
     return 0;
 }
 
+static int presentConnect_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+{
+    struct ioctl_android_present_connect *res = data;
+    struct native_win_data *win_data;
+    int fd;
+
+    if (in_size < sizeof(*res)) return -EINVAL;
+
+    /* the client view may not have its surface yet: the presenter gets it from register_native_window */
+    if (!(win_data = get_ioctl_native_win_data( &res->hdr ))) return -ENOENT;
+    if ((fd = present_connect( LongToHandle( res->hdr.hwnd ), win_data->parent )) < 0) return fd;
+    *reply_fd = fd;
+    return 0;
+}
+
 typedef int (*ioctl_func)( JNIEnv* env, void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd );
 static const ioctl_func ioctl_funcs[] =
 {
@@ -856,6 +878,7 @@ static const ioctl_func ioctl_funcs[] =
     setSwapInterval_ioctl,      /* IOCTL_SET_SWAP_INT */
     setCapture_ioctl,           /* IOCTL_SET_CAPTURE */
     setCursor_ioctl,            /* IOCTL_SET_CURSOR */
+    presentConnect_ioctl,       /* IOCTL_PRESENT_CONNECT */
 };
 
 static ALooper *looper;
@@ -1484,6 +1507,22 @@ int ioctl_set_cursor( int id, int width, int height,
 /**********************************************************************
  *           ANDROID_SetDesktopWindow
  */
+/* Returns the Wine process end of the presentation socket of the window's client surface, or -1. */
+int ioctl_present_connect( HWND hwnd )
+{
+    struct ioctl_android_present_connect req;
+    int fd = -1;
+
+    req.hdr.hwnd = HandleToLong( hwnd );
+    req.hdr.opengl = TRUE;
+    if (android_ioctl( IOCTL_PRESENT_CONNECT, &req, sizeof(req), NULL, NULL, &fd ))
+    {
+        if (fd != -1) close( fd );
+        return -1;
+    }
+    return fd;
+}
+
 void ANDROID_SetDesktopWindow( HWND hwnd )
 {
     desktop_window = hwnd;

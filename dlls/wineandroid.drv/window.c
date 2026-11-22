@@ -255,6 +255,12 @@ void surface_changed( JNIEnv *env, jobject obj, jint win, jobject surface, jbool
 
         register_native_window( data.surface.hwnd, win, data.surface.client );
     }
+    else if (client)
+    {
+        /* the view lost its surface: nothing for the window to redraw, the layer is the presenter's */
+        present_surface_changed( data.surface.hwnd, NULL );
+        return;
+    }
     data.type = SURFACE_CHANGED;
     send_event( &data );
 }

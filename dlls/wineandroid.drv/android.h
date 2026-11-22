@@ -30,6 +30,8 @@
 #include <android/input.h>
 #include <android/looper.h>
 #include <android/native_window_jni.h>
+#include <android/hardware_buffer.h>
+#include <android/surface_control.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -65,6 +67,25 @@ DECL_FUNCPTR( ALooper_forThread );
 DECL_FUNCPTR( ALooper_addFd );
 DECL_FUNCPTR( ALooper_removeFd );
 DECL_FUNCPTR( ALooper_release );
+DECL_FUNCPTR( ANativeWindow_acquire );
+DECL_FUNCPTR( ANativeWindow_getWidth );
+DECL_FUNCPTR( ANativeWindow_getHeight );
+DECL_FUNCPTR( AHardwareBuffer_allocate );
+DECL_FUNCPTR( ASurfaceControl_createFromWindow );
+DECL_FUNCPTR( ASurfaceControl_acquire );
+DECL_FUNCPTR( ASurfaceControl_release );
+DECL_FUNCPTR( ASurfaceTransaction_create );
+DECL_FUNCPTR( ASurfaceTransaction_delete );
+DECL_FUNCPTR( ASurfaceTransaction_apply );
+DECL_FUNCPTR( ASurfaceTransaction_reparent );
+DECL_FUNCPTR( ASurfaceTransaction_setBuffer );
+DECL_FUNCPTR( ASurfaceTransaction_setGeometry );
+DECL_FUNCPTR( ASurfaceTransaction_setBufferTransparency );
+DECL_FUNCPTR( ASurfaceTransaction_setVisibility );
+DECL_FUNCPTR( ASurfaceTransaction_setOnComplete );
+DECL_FUNCPTR( ASurfaceTransactionStats_getPreviousReleaseFenceFd );
+/* API 31, NULL before that */
+extern void (*pASurfaceTransaction_setEnableBackPressure)( ASurfaceTransaction *transaction, ASurfaceControl *surface_control, bool enable );
 #endif
 
 #undef DECL_FUNCPTR
@@ -93,6 +114,56 @@ extern int ioctl_set_window_parent( HWND hwnd, HWND parent );
 extern int ioctl_set_capture( HWND hwnd );
 extern int ioctl_set_cursor( int id, int width, int height,
                              int hotspotx, int hotspoty, const unsigned int *bits );
+extern int ioctl_present_connect( HWND hwnd );
+
+
+/**************************************************************************
+ * Vulkan driver and swapchain presentation
+ *
+ * A client surface (a window's Vulkan surface) has a socket pair between the
+ * Wine process and the host process. Swapchain images are AHardwareBuffers
+ * the Wine process allocates and sends once; after that a frame is a message
+ * naming the image, with the fence of its rendering. The host puts the buffer
+ * on the window's layer and sends the image back, with the compositor's
+ * release fence, when a later frame replaced it.
+ */
+
+struct vulkan_driver_funcs;
+extern UINT ANDROID_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs );
+
+#define PRESENT_MAX_IMAGES 8
+
+enum present_message_type
+{
+    PRESENT_CREATE,   /* to the host: a swapchain; its images follow, one AHardwareBuffer each */
+    PRESENT_FRAME,    /* to the host: show an image; carries the fence of its rendering, if any */
+    PRESENT_DESTROY,  /* to the host: the swapchain is gone */
+    PRESENT_RELEASE,  /* from the host: the image is free; carries the fence to wait for, if any */
+};
+
+enum present_flags
+{
+    PRESENT_OPAQUE = 1,  /* the alpha channel means nothing */
+    PRESENT_FIFO   = 2,  /* show every frame, in order */
+};
+
+struct present_message
+{
+    int type;
+    int swapchain;
+    int image;
+    int count;
+    int width;
+    int height;
+    int flags;
+};
+
+/* host process side */
+extern int present_connect( HWND hwnd, struct ANativeWindow *window );
+extern void present_surface_changed( HWND hwnd, struct ANativeWindow *window );
+/* both sides: one message, with at most one file descriptor */
+extern int present_send( int socket, const struct present_message *msg, int fd );
+extern int present_recv( int socket, struct present_message *msg, int *fd, BOOL wait );
 
 
 /**************************************************************************

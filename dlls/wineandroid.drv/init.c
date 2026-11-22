@@ -328,6 +328,7 @@ static const struct user_driver_funcs android_drv_funcs =
     .pCreateWindowSurface = ANDROID_CreateWindowSurface,
     .pWindowPosChanged = ANDROID_WindowPosChanged,
     .pOpenGLInit = ANDROID_OpenGLInit,
+    .pVulkanInit = ANDROID_VulkanInit,
 };
 
 
@@ -363,6 +364,24 @@ DECL_FUNCPTR( ALooper_forThread );
 DECL_FUNCPTR( ALooper_addFd );
 DECL_FUNCPTR( ALooper_removeFd );
 DECL_FUNCPTR( ALooper_release );
+DECL_FUNCPTR( ANativeWindow_acquire );
+DECL_FUNCPTR( ANativeWindow_getWidth );
+DECL_FUNCPTR( ANativeWindow_getHeight );
+DECL_FUNCPTR( AHardwareBuffer_allocate );
+DECL_FUNCPTR( ASurfaceControl_createFromWindow );
+DECL_FUNCPTR( ASurfaceControl_acquire );
+DECL_FUNCPTR( ASurfaceControl_release );
+DECL_FUNCPTR( ASurfaceTransaction_create );
+DECL_FUNCPTR( ASurfaceTransaction_delete );
+DECL_FUNCPTR( ASurfaceTransaction_apply );
+DECL_FUNCPTR( ASurfaceTransaction_reparent );
+DECL_FUNCPTR( ASurfaceTransaction_setBuffer );
+DECL_FUNCPTR( ASurfaceTransaction_setGeometry );
+DECL_FUNCPTR( ASurfaceTransaction_setBufferTransparency );
+DECL_FUNCPTR( ASurfaceTransaction_setVisibility );
+DECL_FUNCPTR( ASurfaceTransaction_setOnComplete );
+DECL_FUNCPTR( ASurfaceTransactionStats_getPreviousReleaseFenceFd );
+void (*pASurfaceTransaction_setEnableBackPressure)( ASurfaceTransaction *transaction, ASurfaceControl *surface_control, bool enable );
 
 static void load_android_libs(void)
 {
@@ -396,6 +415,24 @@ static void load_android_libs(void)
     LOAD_FUNCPTR( libandroid, ALooper_addFd );
     LOAD_FUNCPTR( libandroid, ALooper_removeFd );
     LOAD_FUNCPTR( libandroid, ALooper_release );
+    LOAD_FUNCPTR( libandroid, ANativeWindow_acquire );
+    LOAD_FUNCPTR( libandroid, ANativeWindow_getWidth );
+    LOAD_FUNCPTR( libandroid, ANativeWindow_getHeight );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_allocate );
+    LOAD_FUNCPTR( libandroid, ASurfaceControl_createFromWindow );
+    LOAD_FUNCPTR( libandroid, ASurfaceControl_acquire );
+    LOAD_FUNCPTR( libandroid, ASurfaceControl_release );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_create );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_delete );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_apply );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_reparent );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_setBuffer );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_setGeometry );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_setBufferTransparency );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_setVisibility );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransaction_setOnComplete );
+    LOAD_FUNCPTR( libandroid, ASurfaceTransactionStats_getPreviousReleaseFenceFd );
+    pASurfaceTransaction_setEnableBackPressure = dlsym( libandroid, "ASurfaceTransaction_setEnableBackPressure" );
 }
 
 #undef DECL_FUNCPTR
