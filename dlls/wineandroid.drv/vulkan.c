@@ -900,6 +900,7 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
     struct present_message msg = {.type = PRESENT_CREATE};
     VkResult res = VK_SUCCESS;
     uint32_t i;
+    BOOL fifo;
 
     TRACE( "device %p, surface %p, %ux%u, format %d, min images %u, mode %d, usage %#x, flags %#x, old %p\n", handle, surface,
            info->imageExtent.width, info->imageExtent.height, info->imageFormat, info->minImageCount, info->presentMode,
@@ -920,7 +921,11 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
     swapchain->device = device;
     swapchain->surface = surface;
     swapchain->extent = info->imageExtent;
-    swapchain->count = min( max( info->minImageCount, 3 ), PRESENT_MAX_IMAGES );
+    /* Showing only the newest frame takes one image more than the surface's minimum: one on screen
+     * until the next takes its place, one with the compositor, one waiting in the host, and one for
+     * the application to draw, or it waits for the compositor after all. */
+    fifo = info->presentMode == VK_PRESENT_MODE_FIFO_KHR || info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    swapchain->count = min( max( info->minImageCount, fifo ? 3 : 4 ), PRESENT_MAX_IMAGES );
     for (i = 0; i < swapchain->count && !res; i++) res = create_image( swapchain, &swapchain->images[i], info );
     if (res) goto failed;
 
@@ -935,8 +940,7 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
         msg.height = swapchain->extent.height;
         /* PRE_MULTIPLIED is the only alpha that would reach the screen, and the surface does not offer it */
         msg.flags = PRESENT_OPAQUE;
-        if (info->presentMode == VK_PRESENT_MODE_FIFO_KHR || info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-            msg.flags |= PRESENT_FIFO;
+        if (fifo) msg.flags |= PRESENT_FIFO;
         if (present_send( surface->socket, &msg, -1 )) res = VK_ERROR_SURFACE_LOST_KHR;
         for (i = 0; i < swapchain->count && !res; i++)
             if (pAHardwareBuffer_sendHandleToUnixSocket( swapchain->images[i].buffer, surface->socket ))
