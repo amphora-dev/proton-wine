@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -141,12 +142,23 @@ struct native_win_wrapper
 };
 
 #define IPC_SOCKET_NAME "\0\\Device\\WineAndroid"
-#define IPC_SOCKET_ADDR_LEN ((socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(IPC_SOCKET_NAME) - 1))
 
-static const struct sockaddr_un ipc_addr = {
-    .sun_family = AF_UNIX,
-    .sun_path = IPC_SOCKET_NAME,
-};
+static socklen_t get_ipc_addr( struct sockaddr_un *addr )
+{
+    const char *env = getenv( "WINE_ANDROID_SOCKET" );
+    size_t len;
+
+    memset( addr, 0, sizeof(*addr) );
+    addr->sun_family = AF_UNIX;
+    if (env && env[0] && (len = strlen( env )) < sizeof(addr->sun_path) - 1)
+    {
+        addr->sun_path[0] = '\0';
+        memcpy( addr->sun_path + 1, env, len );
+        return (socklen_t)(offsetof( struct sockaddr_un, sun_path ) + 1 + len);
+    }
+    memcpy( addr->sun_path, IPC_SOCKET_NAME, sizeof(IPC_SOCKET_NAME) - 1 );
+    return (socklen_t)(offsetof( struct sockaddr_un, sun_path ) + sizeof(IPC_SOCKET_NAME) - 1);
+}
 
 struct ioctl_header
 {
@@ -488,7 +500,11 @@ static int createDesktopView_ioctl( JNIEnv* env, void *data, DWORD in_size, DWOR
 
     if (in_size < sizeof(*res)) return -EINVAL;
 
-    if (event_sink != -1) close(event_sink);
+    if (event_sink != -1)
+    {
+        close( event_sink );
+        event_sink = -1;
+    }
 
     if (pipe2( event_pipe, O_CLOEXEC | O_NONBLOCK ) == -1)
     {
@@ -891,33 +907,74 @@ static JNIEnv *looper_env; /* JNIEnv for the main thread looper. Must only be us
  */
 static int handle_ioctl_message( JNIEnv *env, int fd )
 {
-    char buffer[1024], control[CMSG_SPACE(sizeof(int))];
+    char stack_buf[1024], control[CMSG_SPACE(sizeof(int))];
+    char *buffer = stack_buf, *heap_buf = NULL;
+    size_t buf_size = sizeof(stack_buf);
     int code = 0, status = -EINVAL, reply_fd = -1;
     ULONG_PTR reply_size = 0;
-    ssize_t ret;
-    struct iovec iov[2] = { { &code, sizeof(code) }, { buffer, sizeof(buffer) } };
-    struct iovec reply_iov[2] = { { &status, sizeof(status) }, { buffer, 0 } };
+    ssize_t peek_ret, ret;
+    struct iovec iov[2];
+    struct iovec reply_iov[2];
     struct msghdr msg = { NULL, 0, iov, 2, NULL, 0, 0 };
     struct msghdr reply = { NULL, 0, reply_iov, 2, NULL, 0, 0 };
     struct cmsghdr *cmsg;
+    const size_t max_payload = offsetof( struct ioctl_android_set_cursor, bits[256 * 256] );
 
-    ret = recvmsg( fd, &msg, MSG_DONTWAIT );
-    if (ret < 0)
+    peek_ret = recv( fd, NULL, 0, MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC );
+    if (peek_ret < 0)
     {
         if (errno == EINTR) return 0;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
         return 1;
     }
+    if (!peek_ret || (size_t)peek_ret < sizeof(code))
+    {
+        /* drain the short/EOF message */
+        recv( fd, stack_buf, sizeof(stack_buf), MSG_DONTWAIT );
+        return 1;
+    }
+    if ((size_t)peek_ret > sizeof(code) + sizeof(stack_buf))
+    {
+        size_t need = (size_t)peek_ret - sizeof(code);
+        if (need <= max_payload && (heap_buf = malloc( need )))
+        {
+            buffer = heap_buf;
+            buf_size = need;
+        }
+    }
 
-    if (!ret || ret < sizeof(code)) return 1;
+    iov[0].iov_base = &code;
+    iov[0].iov_len = sizeof(code);
+    iov[1].iov_base = buffer;
+    iov[1].iov_len = buf_size;
+
+    ret = recvmsg( fd, &msg, MSG_DONTWAIT );
+    if (ret < 0)
+    {
+        free( heap_buf );
+        if (errno == EINTR) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return 1;
+    }
+
+    if (!ret || (size_t)ret < sizeof(code))
+    {
+        free( heap_buf );
+        return 1;
+    }
     ret -= sizeof(code);
 
-    if ((unsigned int)code < NB_IOCTLS)
+    if (msg.msg_flags & MSG_TRUNC)
+    {
+        LOG( ERR, "ioctl %x message truncated (%zd bytes)\n", code, peek_ret );
+        status = -EMSGSIZE;
+    }
+    else if ((unsigned int)code < NB_IOCTLS)
     {
         if (ret >= sizeof(struct ioctl_header))
         {
             pthread_mutex_lock( &dispatch_ioctl_lock );
-            status = ioctl_funcs[code]( env, buffer, ret, sizeof(buffer), &reply_size, &reply_fd );
+            status = ioctl_funcs[code]( env, buffer, ret, buf_size, &reply_size, &reply_fd );
             if (IOCTL_CREATE_DESKTOP_VIEW == code) /* special case: desktop client */
                 desktop_client_fd = fd;
             pthread_mutex_unlock( &dispatch_ioctl_lock );
@@ -929,6 +986,9 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         status = -ENOTSUP;
     }
 
+    reply_iov[0].iov_base = &status;
+    reply_iov[0].iov_len = sizeof(status);
+    reply_iov[1].iov_base = buffer;
     reply_iov[1].iov_len = reply_size;
     if (reply_fd != -1)
     {
@@ -942,8 +1002,9 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         reply.msg_controllen = cmsg->cmsg_len;
     }
 
-    ret = sendmsg( fd, &reply, 0 );
+    ret = sendmsg( fd, &reply, MSG_NOSIGNAL );
     if (reply_fd != -1) close( reply_fd );
+    free( heap_buf );
     return ret < 0 ? 1 : 0;
 }
 
@@ -982,6 +1043,17 @@ static int looper_handle_listen( int fd, int events, void *data )
             break;
         }
 
+        {
+            struct ucred cred;
+            socklen_t cred_len = sizeof(cred);
+            if (getsockopt( client, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len ) < 0 || cred.uid != getuid())
+            {
+                LOG( ERR, "Rejecting IPC client with unexpected peer credentials\n" );
+                close( client );
+                continue;
+            }
+        }
+
         if (pALooper_addFd( looper, client, client, ALOOPER_EVENT_INPUT | ALOOPER_EVENT_HANGUP | ALOOPER_EVENT_ERROR, looper_handle_client, NULL ) != 1) {
             LOG( ERR, "Failed to add client to ALooper\n" );
             close( client );
@@ -994,6 +1066,8 @@ static int looper_handle_listen( int fd, int events, void *data )
 /* main Wine initialisation */
 void wine_init_jni( JNIEnv *env, jobject obj )
 {
+    struct sockaddr_un addr;
+    socklen_t addr_len;
     int sockfd;
 
     java_object = (*env)->NewGlobalRef( env, obj );
@@ -1012,7 +1086,8 @@ void wine_init_jni( JNIEnv *env, jobject obj )
         abort();
     }
 
-    if (bind( sockfd, (const struct sockaddr *)&ipc_addr, IPC_SOCKET_ADDR_LEN ) < 0 ||
+    addr_len = get_ipc_addr( &addr );
+    if (bind( sockfd, (const struct sockaddr *)&addr, addr_len ) < 0 ||
         listen( sockfd, 32 ) < 0)
     {
         LOG( ERR, "Failed to bind server socket: %s\n", strerror( errno ) );
@@ -1049,9 +1124,12 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
 
     if (device_fd == -1)
     {
-        device_fd = socket( AF_UNIX, SOCK_SEQPACKET, 0 );
+        struct sockaddr_un addr;
+        socklen_t addr_len = get_ipc_addr( &addr );
+
+        device_fd = socket( AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0 );
         if (device_fd < 0) goto done;
-        if (connect( device_fd, (const struct sockaddr *)&ipc_addr, IPC_SOCKET_ADDR_LEN ) < 0)
+        if (connect( device_fd, (const struct sockaddr *)&addr, addr_len ) < 0)
         {
             close( device_fd );
             device_fd = -1;
@@ -1062,7 +1140,7 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
     ret = writev( device_fd, (struct iovec[]){ { &code, sizeof(code) }, { in, in_size } }, 2 );
     if (ret <= 0 || ret != sizeof(code) + in_size) goto disconnected;
 
-    ret = recvmsg( device_fd, &msg, 0 );
+    ret = recvmsg( device_fd, &msg, MSG_CMSG_CLOEXEC );
     if (ret <= 0 || ret < sizeof(status)) goto disconnected;
 
     if (out && out_size) *out_size = ret - sizeof(status);

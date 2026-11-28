@@ -1138,6 +1138,11 @@ static VkResult create_image( struct swapchain *swapchain, struct image *image, 
         return res;
     }
     for (i = 0; i < 32; i++) if (props.memoryTypeBits & (1u << i)) break;
+    if (i == 32)
+    {
+        ERR( "no compatible memory type for AHardwareBuffer\n" );
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     dedicated_info.image = image->image;
     import_info.buffer = image->buffer;
     alloc_info.allocationSize = props.allocationSize;
@@ -1179,6 +1184,7 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
     }
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (i = 0; i < PRESENT_MAX_IMAGES; i++) swapchain->images[i].release_fence = -1;
     swapchain->device = device;
     swapchain->surface = surface;
     swapchain->extent = info->imageExtent;
@@ -1205,7 +1211,10 @@ static VkResult android_vkCreateSwapchainKHR( VkDevice handle, const VkSwapchain
         if (present_send( surface->socket, &msg, -1 )) res = VK_ERROR_SURFACE_LOST_KHR;
         for (i = 0; i < swapchain->count && !res; i++)
             if (pAHardwareBuffer_sendHandleToUnixSocket( swapchain->images[i].buffer, surface->socket ))
+            {
+                shutdown( surface->socket, SHUT_RDWR );
                 res = VK_ERROR_SURFACE_LOST_KHR;
+            }
         if (!res) list_add_tail( &surface->swapchains, &swapchain->entry );
     }
     pthread_mutex_unlock( &surface->lock );

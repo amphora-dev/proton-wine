@@ -85,6 +85,7 @@ int present_recv( int socket, struct present_message *msg, int *fd, BOOL wait )
     do ret = recvmsg( socket, &hdr, MSG_CMSG_CLOEXEC | (wait ? 0 : MSG_DONTWAIT) );
     while (ret < 0 && errno == EINTR);
     if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    if (ret <= 0) return -1;
 
     for (cmsg = CMSG_FIRSTHDR( &hdr ); cmsg; cmsg = CMSG_NXTHDR( &hdr, cmsg ))
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ))
