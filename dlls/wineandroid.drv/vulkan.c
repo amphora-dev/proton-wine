@@ -755,6 +755,11 @@ static const VkPresentModeKHR present_modes[] =
     VK_PRESENT_MODE_IMMEDIATE_KHR,
 };
 
+/* drawn by the GPU, read by the compositor, or scanned out directly */
+#define SWAPCHAIN_BUFFER_USAGE (AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | \
+                                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | \
+                                AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY)
+
 static uint32_t buffer_format( VkFormat format )
 {
     switch (format)
@@ -764,6 +769,46 @@ static uint32_t buffer_format( VkFormat format )
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
     default: return 0;
     }
+}
+
+static VkSurfaceFormatKHR supported_surface_formats[ARRAY_SIZE(surface_formats)];
+static uint32_t supported_surface_format_count;
+
+static void init_surface_formats(void)
+{
+    AHardwareBuffer_Desc desc =
+    {
+        .width = 64,
+        .height = 64,
+        .layers = 1,
+        .usage = SWAPCHAIN_BUFFER_USAGE,
+    };
+    uint32_t i;
+
+    for (i = 0; i < ARRAY_SIZE(surface_formats); i++)
+    {
+        desc.format = buffer_format( surface_formats[i].format );
+        if (pAHardwareBuffer_isSupported( &desc ))
+            supported_surface_formats[supported_surface_format_count++] = surface_formats[i];
+        else
+            TRACE( "surface format %d (AHB %#x) not supported by gralloc\n",
+                   surface_formats[i].format, desc.format );
+    }
+    if (!supported_surface_format_count)
+    {
+        WARN( "AHardwareBuffer_isSupported rejected all surface formats, falling back\n" );
+        memcpy( supported_surface_formats, surface_formats, sizeof(surface_formats) );
+        supported_surface_format_count = ARRAY_SIZE(surface_formats);
+    }
+}
+
+static const VkSurfaceFormatKHR *get_surface_formats( uint32_t *count )
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+    pthread_once( &once, init_surface_formats );
+    *count = supported_surface_format_count;
+    return supported_surface_formats;
 }
 
 static void surface_destroy( struct client_surface *client )
@@ -878,32 +923,34 @@ static VkResult android_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDe
 static VkResult android_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice physical_device, VkSurfaceKHR surface,
                                                               uint32_t *count, VkSurfaceFormatKHR *formats )
 {
-    uint32_t capacity = *count;
+    uint32_t available, capacity = *count;
+    const VkSurfaceFormatKHR *supported = get_surface_formats( &available );
 
     if (!formats)
     {
-        *count = ARRAY_SIZE(surface_formats);
+        *count = available;
         return VK_SUCCESS;
     }
-    *count = min( capacity, ARRAY_SIZE(surface_formats) );
-    memcpy( formats, surface_formats, *count * sizeof(*formats) );
-    return *count < ARRAY_SIZE(surface_formats) ? VK_INCOMPLETE : VK_SUCCESS;
+    *count = min( capacity, available );
+    memcpy( formats, supported, *count * sizeof(*formats) );
+    return *count < available ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VkResult android_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice physical_device,
                                                                const VkPhysicalDeviceSurfaceInfo2KHR *info,
                                                                uint32_t *count, VkSurfaceFormat2KHR *formats )
 {
-    uint32_t i, capacity = *count;
+    uint32_t i, available, capacity = *count;
+    const VkSurfaceFormatKHR *supported = get_surface_formats( &available );
 
     if (!formats)
     {
-        *count = ARRAY_SIZE(surface_formats);
+        *count = available;
         return VK_SUCCESS;
     }
-    *count = min( capacity, ARRAY_SIZE(surface_formats) );
-    for (i = 0; i < *count; i++) formats[i].surfaceFormat = surface_formats[i];
-    return *count < ARRAY_SIZE(surface_formats) ? VK_INCOMPLETE : VK_SUCCESS;
+    *count = min( capacity, available );
+    for (i = 0; i < *count; i++) formats[i].surfaceFormat = supported[i];
+    return *count < available ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VkResult android_vkGetPhysicalDeviceSurfacePresentModesKHR( VkPhysicalDevice physical_device, VkSurfaceKHR surface,
@@ -1047,9 +1094,7 @@ static VkResult create_image( struct swapchain *swapchain, struct image *image, 
         .height = info->imageExtent.height,
         .layers = 1,
         .format = buffer_format( info->imageFormat ),
-        /* drawn by the GPU, read by the compositor, or scanned out directly */
-        .usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+        .usage = SWAPCHAIN_BUFFER_USAGE,
     };
     struct device *device = swapchain->device;
     const VkBaseInStructure *chained;

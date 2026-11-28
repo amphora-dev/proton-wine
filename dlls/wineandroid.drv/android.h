@@ -71,6 +71,7 @@ DECL_FUNCPTR( ANativeWindow_acquire );
 DECL_FUNCPTR( ANativeWindow_getWidth );
 DECL_FUNCPTR( ANativeWindow_getHeight );
 DECL_FUNCPTR( AHardwareBuffer_allocate );
+DECL_FUNCPTR( AHardwareBuffer_isSupported );
 DECL_FUNCPTR( ASurfaceControl_createFromWindow );
 DECL_FUNCPTR( ASurfaceControl_acquire );
 DECL_FUNCPTR( ASurfaceControl_release );

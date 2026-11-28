@@ -368,6 +368,7 @@ DECL_FUNCPTR( ANativeWindow_acquire );
 DECL_FUNCPTR( ANativeWindow_getWidth );
 DECL_FUNCPTR( ANativeWindow_getHeight );
 DECL_FUNCPTR( AHardwareBuffer_allocate );
+DECL_FUNCPTR( AHardwareBuffer_isSupported );
 DECL_FUNCPTR( ASurfaceControl_createFromWindow );
 DECL_FUNCPTR( ASurfaceControl_acquire );
 DECL_FUNCPTR( ASurfaceControl_release );
@@ -419,6 +420,7 @@ static void load_android_libs(void)
     LOAD_FUNCPTR( libandroid, ANativeWindow_getWidth );
     LOAD_FUNCPTR( libandroid, ANativeWindow_getHeight );
     LOAD_FUNCPTR( libandroid, AHardwareBuffer_allocate );
+    LOAD_FUNCPTR( libandroid, AHardwareBuffer_isSupported );
     LOAD_FUNCPTR( libandroid, ASurfaceControl_createFromWindow );
     LOAD_FUNCPTR( libandroid, ASurfaceControl_acquire );
     LOAD_FUNCPTR( libandroid, ASurfaceControl_release );
