@@ -724,6 +724,25 @@ static const NLS_LOCALE_DATA *get_win_locale( const NLS_LOCALE_HEADER *header, c
 }
 
 
+#ifdef __ANDROID__
+/* Bionic's setlocale() always reports "C.UTF-8" regardless of LC_ALL/LANG,
+ * so read the requested Unix locale directly from the environment. */
+static const char *android_requested_locale( const char *actual, const char *category )
+{
+    const char *env;
+
+    if (actual && actual[0] && strcmp( actual, "C" ) && strcmp( actual, "C.UTF-8" ) &&
+        strcmp( actual, "C.utf8" ) && strcmp( actual, "POSIX" ) && strcmp( actual, "en_US.UTF-8" ))
+        return actual;
+
+    if ((env = getenv( "LC_ALL" )) && env[0]) return env;
+    if (category && (env = getenv( category )) && env[0]) return env;
+    if ((env = getenv( "LANG" )) && env[0]) return env;
+    return actual;
+}
+#endif
+
+
 /******************************************************************
  *		init_locale
  */
@@ -741,6 +760,11 @@ static void init_locale(void)
         FIXME_(nls)( "Failed to set LC_CTYPE to %s, is the locale supported?\n", debugstr_a(ctype) );
     if (!(messages = setlocale( LC_MESSAGES, "" )) && (messages = getenv( "LC_MESSAGES" )))
         FIXME_(nls)( "Failed to set LC_MESSAGES to %s, is the locale supported?\n", debugstr_a(messages) );
+
+#ifdef __ANDROID__
+    ctype = android_requested_locale( ctype, "LC_CTYPE" );
+    messages = android_requested_locale( messages, "LC_MESSAGES" );
+#endif
 
     if (!unix_to_win_locale( ctype, system_locale )) system_locale[0] = 0;
     TRACE_(nls)( "Unix LC_CTYPE is %s, setting system locale to %s\n", debugstr_a(ctype), debugstr_a(user_locale) );
